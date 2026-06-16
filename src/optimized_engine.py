@@ -65,6 +65,7 @@ class OptimizedEngine:
         self._kg = None       # KGramTable
         self._nm = None       # NFAMatrices
         self._gpu_engine = None  # MonoidEngine (GPU)
+        self._batched_gpu = None  # BatchedEvolutionEngine (GPU)
 
         self._representation = None   # "dfa" | "nfa"
         self._scan_backend = None     # "sequential" | "monoid" | "monoid+kgram" | "nfa"
@@ -84,10 +85,13 @@ class OptimizedEngine:
         elif config == "monoid+gpu":
             self._force_monoid()
             self._setup_gpu_monoid()
+        elif config == "batched+gpu":
+            self._force_baseline()
+            self._setup_batched_gpu()
         else:
             raise ValueError(f"Unknown config: {config!r}. "
                              f"Choose from None, 'monoid', 'monoid+kgram', 'baseline', 'nfa', "
-                             f"'monoid+gpu'.")
+                             f"'monoid+gpu', 'batched+gpu'.")
 
     # ── Private setup helpers ────────────────────────────────────────────────
 
@@ -188,6 +192,14 @@ class OptimizedEngine:
         self._scan_backend = 'monoid+gpu'
         self._selection_reason = 'GPU monoid scan'
 
+    def _setup_batched_gpu(self):
+        self._build_dfa()
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        sim = BatchedGPUSimulator()
+        self._batched_gpu = sim.create_engine(self._dm)
+        self._scan_backend = 'batched+gpu'
+        self._selection_reason = 'GPU batched state-vector evolution'
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -237,6 +249,8 @@ class OptimizedEngine:
         """Match a list of strings. Returns list[bool]."""
         if self._gpu_engine is not None:
             return self._gpu_engine.simulate_batch(strings)
+        if self._batched_gpu is not None:
+            return self._batched_gpu.simulate_batch(strings)
         return [self._match_one(s) for s in strings]
 
     def match_batch_timed(self, strings: list) -> tuple:
@@ -247,6 +261,9 @@ class OptimizedEngine:
         """
         if self._gpu_engine is not None:
             results, kern_ms, total_ms = self._gpu_engine.simulate_batch_timed(strings)
+            return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
+        if self._batched_gpu is not None:
+            results, kern_ms, total_ms = self._batched_gpu.simulate_batch_timed(strings)
             return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
         t0 = time.perf_counter()
         results = self.match_batch(strings)

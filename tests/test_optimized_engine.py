@@ -281,3 +281,62 @@ class TestOptimizedEngineGPU:
         expected = simulate_sequential(dfa, s)
         got = engine.match_batch([s])[0]
         assert got == expected
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. Batched Evolution GPU Integration
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _batched_gpu_available():
+    try:
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        BatchedGPUSimulator()
+        return True
+    except Exception:
+        return False
+
+
+skip_no_batched_gpu = pytest.mark.skipif(
+    not _batched_gpu_available(), reason="Batched GPU not available"
+)
+
+
+@skip_no_batched_gpu
+class TestBatchedEvolutionIntegration:
+
+    @pytest.mark.parametrize("pattern_name",
+        ['abb', 'binary_div3', 'even_a', 'ab_star'])
+    def test_batched_gpu_matches_baseline(self, pattern_name):
+        pat = PATTERNS[pattern_name]
+        engine_base = OptimizedEngine(pat.regex, config="baseline")
+        engine_batched = OptimizedEngine(pat.regex, config="batched+gpu")
+
+        strings = _random_strings(pattern_name, 500, seed=42)
+        expected = engine_base.match_batch(strings)
+        actual = engine_batched.match_batch(strings)
+        assert actual == expected, f"batched+gpu mismatch for {pattern_name}"
+
+    def test_batched_gpu_config_info(self):
+        engine = OptimizedEngine("(a|b)*abb", config="batched+gpu")
+        info = engine.config_info
+        assert info["scan_backend"] == "batched+gpu"
+
+    def test_batched_gpu_timed(self):
+        engine = OptimizedEngine("(a|b)*abb", config="batched+gpu")
+        strings = _random_strings("abb", 200, seed=42)
+        results, timing = engine.match_batch_timed(strings)
+        assert isinstance(results, list)
+        assert len(results) == 200
+        assert "kernel_ms" in timing
+        assert "total_ms" in timing
+
+    @pytest.mark.parametrize("pattern_name", ["hex_number", "identifier"])
+    def test_batched_gpu_larger_alphabet(self, pattern_name):
+        pat = PATTERNS[pattern_name]
+        engine_base = OptimizedEngine(pat.regex, config="baseline")
+        engine_batched = OptimizedEngine(pat.regex, config="batched+gpu")
+
+        strings = _random_strings(pattern_name, 200, seed=99)
+        expected = engine_base.match_batch(strings)
+        actual = engine_batched.match_batch(strings)
+        assert actual == expected, f"batched+gpu mismatch for {pattern_name}"
