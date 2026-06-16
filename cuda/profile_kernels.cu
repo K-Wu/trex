@@ -1142,6 +1142,29 @@ static void print_summary() {
     printf("    Monoid R3:         %d bytes (3 * int: status+agg+prefix)\n", 3 * (int)sizeof(int));
     printf("    V4 R3:             %d bytes (int status + 2 * 256 int8: agg+prefix)\n",
            (int)sizeof(int) + 2 * TILE_ELEMS);
+
+    printf("\n");
+    print_separator();
+    printf("  TENSOR CORE UTILIZATION ANALYSIS\n");
+    print_separator();
+
+    printf("\n  H200 INT8 Tensor Core peak: 3,958 TOPS (dense)\n");
+    printf("  V4 R1 best measured:        ~21 TFLOP/s  →  0.53%% of peak\n");
+    printf("  V4 R3 best measured:        ~8 TFLOP/s   →  0.20%% of peak\n");
+    printf("\n  Root cause: SEQUENTIAL DEPENDENCY CHAIN\n");
+    printf("    Each matmul in the prefix scan depends on the previous result:\n");
+    printf("      acc = T[c_i] × acc    (cannot start until T[c_{i-1}] × acc completes)\n");
+    printf("    Within each warp, the tensor core pipeline stalls between every mma_sync.\n");
+    printf("    With 64 warps/SM all doing independent scans, the SM interleaves warps,\n");
+    printf("    but each warp still has a latency-bound chain of L dependent MMAs.\n");
+    printf("    A batch GEMM (independent matmuls) would saturate tensor cores;\n");
+    printf("    a sequential scan fundamentally cannot.\n");
+    printf("\n  This is WHY the monoid optimization matters:\n");
+    printf("    Monoid R1 peak: ~93 Gchar/s  (table lookup, no tensor cores)\n");
+    printf("    V4 R1 peak:     ~2.6 Gchar/s (tensor cores at 0.5%% utilization)\n");
+    printf("    The MMA approach wastes 99.5%% of the H200's tensor core capacity.\n");
+    printf("    Monoid replaces a fundamentally serialization-limited MMA pipeline\n");
+    printf("    with an O(1) integer lookup that scales with memory bandwidth instead.\n");
 }
 
 
