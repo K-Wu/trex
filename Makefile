@@ -18,7 +18,11 @@ SRC    = $(CUDA_DIR)/tensor_core_dfa_scan.cu
 EXE    = $(BUILD_DIR)/dfa_scan
 LIB    = $(BUILD_DIR)/libdfa_scan.so
 
-all: $(BUILD_DIR) $(EXE) $(LIB)
+SRC_V4 = $(CUDA_DIR)/parallel_dfa_engine.cu
+EXE_V4 = $(BUILD_DIR)/parallel_engine
+LIB_V4 = $(BUILD_DIR)/libparallel_engine.so
+
+all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -29,6 +33,12 @@ $(EXE): $(SRC) | $(BUILD_DIR)
 $(LIB): $(SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
 
+$(EXE_V4): $(SRC_V4) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $<
+
+$(LIB_V4): $(SRC_V4) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -37,6 +47,9 @@ test-py:
 
 test-gpu: $(EXE)
 	./$(EXE)
+
+test-v4: $(EXE_V4)
+	./$(EXE_V4)
 
 test-all: test-gpu test-py
 
@@ -51,4 +64,4 @@ eval: $(LIB)
 
 bench-all: bench-cpu bench-gpu
 
-.PHONY: all clean test-py test-gpu test-all bench-cpu bench-gpu eval bench-all
+.PHONY: all clean test-py test-gpu test-v4 test-all bench-cpu bench-gpu eval bench-all
