@@ -26,6 +26,9 @@ SRC_MONOID = $(CUDA_DIR)/monoid_scan.cu
 EXE_MONOID = $(BUILD_DIR)/monoid_scan
 LIB_MONOID = $(BUILD_DIR)/libmonoid_scan.so
 
+SRC_PROFILE = $(CUDA_DIR)/profile_kernels.cu
+EXE_PROFILE = $(BUILD_DIR)/profile_kernels
+
 all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID)
 
 $(BUILD_DIR):
@@ -48,6 +51,12 @@ $(EXE_MONOID): $(SRC_MONOID) | $(BUILD_DIR)
 
 $(LIB_MONOID): $(SRC_MONOID) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
+
+$(EXE_PROFILE): $(SRC_PROFILE) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -lineinfo -o $@ $<
+
+profile: $(EXE_PROFILE)
+	./$(EXE_PROFILE)
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -77,4 +86,4 @@ eval: $(LIB)
 
 bench-all: bench-cpu bench-gpu
 
-.PHONY: all clean test-py test-gpu test-v4 test-monoid test-all bench-cpu bench-gpu eval bench-all
+.PHONY: all clean test-py test-gpu test-v4 test-monoid test-all bench-cpu bench-gpu eval bench-all profile
