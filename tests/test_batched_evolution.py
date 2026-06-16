@@ -163,5 +163,144 @@ class TestScale:
         _cross_validate(dfa, dm, strings)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# GPU Tests: Batched Evolution via CUDA
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _gpu_available():
+    """Check if the batched evolution GPU engine is available."""
+    try:
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        BatchedGPUSimulator()
+        return True
+    except Exception:
+        return False
+
+
+def _sequential_results(dfa, strings):
+    """Reference results from sequential simulation."""
+    return [simulate_sequential(dfa, s) for s in strings]
+
+
+@pytest.mark.skipif(not _gpu_available(), reason="GPU not available or libbatched_evolution.so not found")
+class TestBatchedEvolutionGPU:
+
+    @pytest.mark.parametrize("pattern_name", ["abb", "even_a", "binary_div3", "ab_star"])
+    def test_gpu_matches_cpu_binary(self, pattern_name):
+        """200 random strings x 128 chars, cross-validated against sequential."""
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        pat = PATTERNS[pattern_name]
+        dfa = compile_regex(pat.regex)
+        dm = DFAMatrices(dfa)
+        alphabet = _get_alphabet(pattern_name)
+        rng = random.Random(42)
+        strings = [gen_random_string(alphabet, 128, rng) for _ in range(200)]
+
+        sim = BatchedGPUSimulator()
+        engine = sim.create_engine(dm)
+        gpu_results = engine.simulate_batch(strings)
+        engine.destroy()
+
+        expected = _sequential_results(dfa, strings)
+        assert len(gpu_results) == len(expected)
+        for i, (e, g) in enumerate(zip(expected, gpu_results)):
+            assert e == g, (
+                f"Mismatch at index {i}, string '{strings[i][:60]}...' "
+                f"(len={len(strings[i])}): sequential={e} gpu={g}"
+            )
+
+    @pytest.mark.parametrize("pattern_name", ["hex_number", "identifier"])
+    def test_gpu_matches_cpu_general(self, pattern_name):
+        """100 random strings x 64 chars, cross-validated against sequential."""
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        pat = PATTERNS[pattern_name]
+        dfa = compile_regex(pat.regex)
+        dm = DFAMatrices(dfa)
+        alphabet = _get_alphabet(pattern_name)
+        rng = random.Random(99)
+        strings = [gen_random_string(alphabet, 64, rng) for _ in range(100)]
+
+        sim = BatchedGPUSimulator()
+        engine = sim.create_engine(dm)
+        gpu_results = engine.simulate_batch(strings)
+        engine.destroy()
+
+        expected = _sequential_results(dfa, strings)
+        assert len(gpu_results) == len(expected)
+        for i, (e, g) in enumerate(zip(expected, gpu_results)):
+            assert e == g, (
+                f"Mismatch at index {i}, string '{strings[i][:60]}...' "
+                f"(len={len(strings[i])}): sequential={e} gpu={g}"
+            )
+
+    def test_gpu_variable_length(self):
+        """Mix of lengths including empty strings should be handled correctly."""
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        dfa = compile_regex("(a|b)*abb")
+        dm = DFAMatrices(dfa)
+        strings = ["abb", "a", "aabb", "", "babb", "ab", "ababababb", "b",
+                    "", "abb", "bb", "aab", "abbb", "", "bbbabb"]
+
+        sim = BatchedGPUSimulator()
+        engine = sim.create_engine(dm)
+        gpu_results = engine.simulate_batch(strings)
+        engine.destroy()
+
+        expected = _sequential_results(dfa, strings)
+        assert len(gpu_results) == len(expected)
+        for i, (e, g) in enumerate(zip(expected, gpu_results)):
+            assert e == g, (
+                f"Mismatch at index {i}, string '{strings[i]}': "
+                f"sequential={e} gpu={g}"
+            )
+
+    def test_gpu_large_batch(self):
+        """4096 strings x 256 chars, cross-validated against sequential."""
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        dfa = compile_regex("(a|b)*abb")
+        dm = DFAMatrices(dfa)
+        rng = random.Random(77)
+        strings = [gen_random_string('ab', 256, rng) for _ in range(4096)]
+
+        sim = BatchedGPUSimulator()
+        engine = sim.create_engine(dm)
+        gpu_results = engine.simulate_batch(strings)
+        engine.destroy()
+
+        expected = _sequential_results(dfa, strings)
+        assert len(gpu_results) == len(expected)
+        mismatches = [(i, expected[i], gpu_results[i]) for i in range(len(expected))
+                      if expected[i] != gpu_results[i]]
+        assert not mismatches, (
+            f"{len(mismatches)} mismatches out of {len(expected)} strings. "
+            f"First 5: {mismatches[:5]}"
+        )
+
+    def test_gpu_timed(self):
+        """Verify timed interface returns valid types."""
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        dfa = compile_regex("(a|b)*abb")
+        dm = DFAMatrices(dfa)
+        rng = random.Random(42)
+        strings = [gen_random_string('ab', 64, rng) for _ in range(100)]
+
+        sim = BatchedGPUSimulator()
+        engine = sim.create_engine(dm)
+        results, kern_ms, total_ms = engine.simulate_batch_timed(strings)
+        engine.destroy()
+
+        assert isinstance(results, list)
+        assert len(results) == len(strings)
+        assert all(isinstance(r, bool) for r in results)
+        assert isinstance(kern_ms, float)
+        assert isinstance(total_ms, float)
+        assert kern_ms >= 0.0
+        assert total_ms >= 0.0
+
+        # Cross-validate results
+        expected = _sequential_results(dfa, strings)
+        assert results == expected
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])

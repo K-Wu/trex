@@ -132,21 +132,25 @@ __global__ void batched_evolution_binary_kernel(
         // input[t * B_padded + string_col] gives the char index for string string_col at position t
         // acc is stored row-major: acc[row * 16 + col]
         // S_sh is col-major: S_sh[col * 16 + row]
+        // Identity (ch >= 2): leave S_sh unchanged (string already ended or padding)
         for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
             int col = e / TILE;  // col-major index
             int row = e % TILE;
             int string_id = warp_col_start + col;
-            uint8_t ch = 0;
+            uint8_t ch = 2;  // default to identity for out-of-bounds columns
             if (string_id < B_padded) {
                 ch = input[t * B_padded + string_id];
             }
-            // acc row-major index: row * 16 + col
-            int32_t val;
-            if (ch == 0)
-                val = acc0_sh[row * TILE + col];
-            else
-                val = acc1_sh[row * TILE + col];
-            S_sh[e] = (int8_t)(val > 0 ? 1 : 0);
+            if (ch < 2) {
+                // acc row-major index: row * 16 + col
+                int32_t val;
+                if (ch == 0)
+                    val = acc0_sh[row * TILE + col];
+                else
+                    val = acc1_sh[row * TILE + col];
+                S_sh[e] = (int8_t)(val > 0 ? 1 : 0);
+            }
+            // else: identity — S_sh[e] stays unchanged
         }
         __syncwarp();
     }
@@ -172,11 +176,11 @@ __global__ void batched_evolution_binary_kernel(
 // ---- General Kernel (|Sigma| > 2) ----------------------------------------
 //
 // Shared memory layout:
-//   T_sh[16][16]            256 bytes   -- transition matrix workspace
+//   T_sh[4][16][16]         1024 bytes  -- transition matrix workspace (per warp)
 //   S_sh[4][16][16]         1024 bytes  -- state tiles (col-major per warp)
 //   acc_sh[4][16][16]       4096 bytes  -- int32 accumulators
 //   S_tmp[4][16][16]        1024 bytes  -- temp state for accumulation
-//   Total:                  6400 bytes
+//   Total:                  7168 bytes
 
 __global__ void batched_evolution_general_kernel(
     const int8_t  *__restrict__ trans_matrices, // [sigma][16][16] row-major per matrix
@@ -196,11 +200,12 @@ __global__ void batched_evolution_general_kernel(
     int warp_col_start = block_col_start + warp_in_block * TILE;
 
     extern __shared__ char smem_raw[];
-    int8_t  *T_sh    = (int8_t *)smem_raw;                                      // 256
-    int8_t  *S_base  = T_sh + TILE_ELEMS;                                       // 4 * 256
+    int8_t  *T_base  = (int8_t *)smem_raw;                                      // 4 * 256
+    int8_t  *S_base  = T_base + WARPS_PER_BLOCK * TILE_ELEMS;                   // 4 * 256
     int32_t *acc_base = (int32_t *)(S_base + WARPS_PER_BLOCK * TILE_ELEMS);     // 4 * 1024
     int8_t  *Stmp_base = (int8_t *)(acc_base + WARPS_PER_BLOCK * TILE_ELEMS);   // 4 * 256
 
+    int8_t  *T_sh    = T_base + warp_in_block * TILE_ELEMS;
     int8_t  *S_sh    = S_base + warp_in_block * TILE_ELEMS;
     int32_t *acc_sh  = acc_base + warp_in_block * TILE_ELEMS;
     int8_t  *S_tmp   = Stmp_base + warp_in_block * TILE_ELEMS;
@@ -409,10 +414,11 @@ struct BatchedEngine {
                 d_results);
         } else {
             // General kernel
-            // Shared memory: 256 (T) + 4*256 (S) + 4*1024 (acc) + 4*256 (S_tmp)
+            // Shared memory: 4*256 (T) + 4*256 (S) + 4*1024 (acc) + 4*256 (S_tmp)
             // identity_idx = sigma (one past last valid char)
             int identity_idx = sigma;
-            int smem = TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS
+            int smem = WARPS_PER_BLOCK * TILE_ELEMS
+                       + WARPS_PER_BLOCK * TILE_ELEMS
                        + WARPS_PER_BLOCK * TILE_ELEMS * (int)sizeof(int32_t)
                        + WARPS_PER_BLOCK * TILE_ELEMS;
             batched_evolution_general_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
