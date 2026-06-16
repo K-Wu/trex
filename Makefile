@@ -22,7 +22,11 @@ SRC_V4 = $(CUDA_DIR)/parallel_dfa_engine.cu
 EXE_V4 = $(BUILD_DIR)/parallel_engine
 LIB_V4 = $(BUILD_DIR)/libparallel_engine.so
 
-all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4)
+SRC_MONOID = $(CUDA_DIR)/monoid_scan.cu
+EXE_MONOID = $(BUILD_DIR)/monoid_scan
+LIB_MONOID = $(BUILD_DIR)/libmonoid_scan.so
+
+all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -39,6 +43,12 @@ $(EXE_V4): $(SRC_V4) | $(BUILD_DIR)
 $(LIB_V4): $(SRC_V4) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
 
+$(EXE_MONOID): $(SRC_MONOID) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $<
+
+$(LIB_MONOID): $(SRC_MONOID) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -50,6 +60,9 @@ test-gpu: $(EXE)
 
 test-v4: $(EXE_V4)
 	./$(EXE_V4)
+
+test-monoid: $(EXE_MONOID)
+	./$(EXE_MONOID)
 
 test-all: test-gpu test-py
 
@@ -64,4 +77,4 @@ eval: $(LIB)
 
 bench-all: bench-cpu bench-gpu
 
-.PHONY: all clean test-py test-gpu test-v4 test-all bench-cpu bench-gpu eval bench-all
+.PHONY: all clean test-py test-gpu test-v4 test-monoid test-all bench-cpu bench-gpu eval bench-all
