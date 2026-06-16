@@ -29,7 +29,11 @@ LIB_MONOID = $(BUILD_DIR)/libmonoid_scan.so
 SRC_PROFILE = $(CUDA_DIR)/profile_kernels.cu
 EXE_PROFILE = $(BUILD_DIR)/profile_kernels
 
-all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID)
+SRC_BATCHED = $(CUDA_DIR)/batched_evolution.cu
+EXE_BATCHED = $(BUILD_DIR)/batched_evolution
+LIB_BATCHED = $(BUILD_DIR)/libbatched_evolution.so
+
+all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID) $(EXE_BATCHED) $(LIB_BATCHED)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -50,6 +54,12 @@ $(EXE_MONOID): $(SRC_MONOID) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $<
 
 $(LIB_MONOID): $(SRC_MONOID) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
+
+$(EXE_BATCHED): $(SRC_BATCHED) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $<
+
+$(LIB_BATCHED): $(SRC_BATCHED) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
 
 $(EXE_PROFILE): $(SRC_PROFILE) | $(BUILD_DIR)
@@ -73,6 +83,9 @@ test-v4: $(EXE_V4)
 test-monoid: $(EXE_MONOID)
 	./$(EXE_MONOID)
 
+test-batched: $(EXE_BATCHED)
+	./$(EXE_BATCHED)
+
 test-all: test-gpu test-py
 
 bench-cpu:
@@ -86,4 +99,4 @@ eval: $(LIB)
 
 bench-all: bench-cpu bench-gpu
 
-.PHONY: all clean test-py test-gpu test-v4 test-monoid test-all bench-cpu bench-gpu eval bench-all profile
+.PHONY: all clean test-py test-gpu test-v4 test-monoid test-batched test-all bench-cpu bench-gpu eval bench-all profile
