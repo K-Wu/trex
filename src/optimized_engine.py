@@ -64,6 +64,7 @@ class OptimizedEngine:
         self._md = None       # MonoidData
         self._kg = None       # KGramTable
         self._nm = None       # NFAMatrices
+        self._gpu_engine = None  # MonoidEngine (GPU)
 
         self._representation = None   # "dfa" | "nfa"
         self._scan_backend = None     # "sequential" | "monoid" | "monoid+kgram" | "nfa"
@@ -80,9 +81,13 @@ class OptimizedEngine:
             self._force_baseline()
         elif config == "nfa":
             self._force_nfa()
+        elif config == "monoid+gpu":
+            self._force_monoid()
+            self._setup_gpu_monoid()
         else:
             raise ValueError(f"Unknown config: {config!r}. "
-                             f"Choose from None, 'monoid', 'monoid+kgram', 'baseline', 'nfa'.")
+                             f"Choose from None, 'monoid', 'monoid+kgram', 'baseline', 'nfa', "
+                             f"'monoid+gpu'.")
 
     # ── Private setup helpers ────────────────────────────────────────────────
 
@@ -174,6 +179,15 @@ class OptimizedEngine:
         self._scan_backend = "nfa"
         self._selection_reason = "forced config='nfa'"
 
+    def _setup_gpu_monoid(self):
+        if self._md is None:
+            raise RuntimeError("Monoid computation failed; cannot use GPU monoid")
+        from src.gpu_bridge_monoid import MonoidGPUSimulator
+        sim = MonoidGPUSimulator()
+        self._gpu_engine = sim.create_engine(self._md, self._dm)
+        self._scan_backend = 'monoid+gpu'
+        self._selection_reason = 'GPU monoid scan'
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -208,6 +222,8 @@ class OptimizedEngine:
 
     def _match_one(self, s: str) -> bool:
         """Dispatch a single string to the active backend."""
+        if self._gpu_engine is not None:
+            return self._gpu_engine.simulate_batch([s])[0]
         if self._nm is not None:
             return simulate_nfa(self._nm, s)
         if self._md is not None and self._kg is not None:
@@ -219,13 +235,19 @@ class OptimizedEngine:
 
     def match_batch(self, strings: list) -> list:
         """Match a list of strings. Returns list[bool]."""
+        if self._gpu_engine is not None:
+            return self._gpu_engine.simulate_batch(strings)
         return [self._match_one(s) for s in strings]
 
     def match_batch_timed(self, strings: list) -> tuple:
         """Match a list of strings and return (results, timing_dict).
 
         timing_dict keys: total_seconds, per_string_seconds, n_strings.
+        For GPU config: kernel_ms and total_ms keys are also provided.
         """
+        if self._gpu_engine is not None:
+            results, kern_ms, total_ms = self._gpu_engine.simulate_batch_timed(strings)
+            return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
         t0 = time.perf_counter()
         results = self.match_batch(strings)
         t1 = time.perf_counter()

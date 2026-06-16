@@ -208,12 +208,14 @@ class TestAllConfigsSameResult:
     """All configs must produce identical results for the same inputs."""
 
     def test_all_configs_agree(self):
-        """None, 'monoid', 'monoid+kgram', 'baseline', 'nfa' must agree on 200 strings."""
+        """None, 'monoid', 'monoid+kgram', 'baseline', 'nfa', 'monoid+gpu' must agree on 200 strings."""
         pattern_name = "abb"
         strings = _random_strings(pattern_name, 200, seed=99)
         regex = PATTERNS[pattern_name].regex
 
         configs = [None, "monoid", "monoid+kgram", "baseline", "nfa"]
+        if _gpu_available():
+            configs.append("monoid+gpu")
         results_per_config = {}
 
         for cfg in configs:
@@ -233,3 +235,49 @@ class TestAllConfigsSameResult:
                 f"Config {cfg!r} disagrees with 'baseline' on "
                 f"{len(mismatches)} strings: {mismatches[:5]}"
             )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. GPU helper and TestOptimizedEngineGPU
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _gpu_available():
+    try:
+        from src.gpu_bridge_monoid import MonoidGPUSimulator
+        MonoidGPUSimulator()
+        return True
+    except Exception:
+        return False
+
+
+skip_no_gpu = pytest.mark.skipif(not _gpu_available(), reason="GPU not available")
+
+
+@skip_no_gpu
+class TestOptimizedEngineGPU:
+    @pytest.mark.parametrize("pattern_name",
+        ['abb', 'binary_div3', 'even_a', 'ab_star'])
+    def test_gpu_monoid_matches_cpu(self, pattern_name):
+        pat = PATTERNS[pattern_name]
+
+        cpu_engine = OptimizedEngine(pat.regex, config="monoid")
+        gpu_engine = OptimizedEngine(pat.regex, config="monoid+gpu")
+
+        random.seed(42)
+        alpha = sorted(compile_regex(pat.regex).alphabet)
+        strings = [''.join(random.choice(alpha) for _ in range(random.randint(0, 200)))
+                    for _ in range(200)]
+
+        cpu_results = cpu_engine.match_batch(strings)
+        gpu_results = gpu_engine.match_batch(strings)
+        assert gpu_results == cpu_results
+
+    def test_gpu_long_string(self):
+        engine = OptimizedEngine('(a|b)*abb', config="monoid+gpu")
+
+        random.seed(77)
+        s = ''.join(random.choice('ab') for _ in range(100000))
+        dfa = compile_regex('(a|b)*abb')
+        expected = simulate_sequential(dfa, s)
+        got = engine.match_batch([s])[0]
+        assert got == expected
