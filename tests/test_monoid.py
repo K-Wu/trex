@@ -329,5 +329,118 @@ class TestMonoidSizeGuard:
         assert md_exact.size == md_full.size
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. TestMonoidGPU  — cross-validate GPU engine against simulate_sequential
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _monoid_gpu_available():
+    try:
+        from src.gpu_bridge_monoid import MonoidGPUSimulator
+        MonoidGPUSimulator()
+        return True
+    except Exception:
+        return False
+
+
+skip_no_monoid_gpu = pytest.mark.skipif(
+    not _monoid_gpu_available(), reason="monoid GPU engine not available")
+
+
+@pytest.fixture(scope="module")
+def monoid_simulator():
+    from src.gpu_bridge_monoid import MonoidGPUSimulator
+    return MonoidGPUSimulator()
+
+
+GPU_PATTERNS = ["abb", "binary_div3", "even_a", "ab_star"]
+
+
+@skip_no_monoid_gpu
+class TestMonoidGPU:
+    """Cross-validate MonoidEngine (GPU) against simulate_sequential (CPU)."""
+
+    def test_batch_cross_validate(self, monoid_simulator):
+        """For each pattern, run 500 random strings and compare GPU vs CPU."""
+        for pattern_name in GPU_PATTERNS:
+            dm, dfa = _make_dm(pattern_name)
+            md = compute_monoid(dm)
+            assert md is not None, f"compute_monoid returned None for '{pattern_name}'"
+
+            engine = monoid_simulator.create_engine(md, dm)
+            alphabet = _get_alphabet(pattern_name)
+            rng = random.Random(hash(pattern_name) & 0xFFFFFFFF)
+
+            strings = []
+            # Include empty string
+            strings.append("")
+            # 499 random strings of length 0–200
+            for _ in range(499):
+                length = rng.randint(0, 200)
+                strings.append("".join(rng.choice(alphabet) for _ in range(length)))
+
+            gpu_results = engine.simulate_batch(strings)
+            cpu_results = [simulate_sequential(dfa, s) for s in strings]
+
+            mismatches = [
+                (s, cpu, gpu)
+                for s, cpu, gpu in zip(strings, cpu_results, gpu_results)
+                if cpu != gpu
+            ]
+            assert not mismatches, (
+                f"GPU vs CPU mismatches for '{pattern_name}' "
+                f"({len(mismatches)}/500 failed):\n" +
+                "\n".join(
+                    f"  '{s[:40]}' expected={e} got={g}"
+                    for s, e, g in mismatches[:10]
+                )
+            )
+            engine.destroy()
+
+    def test_long_string(self, monoid_simulator):
+        """Single strings at L=10000, 100000, 1000000 — cross-validate GPU vs CPU."""
+        dm, dfa = _make_dm("even_a")
+        md = compute_monoid(dm)
+        assert md is not None
+
+        engine = monoid_simulator.create_engine(md, dm,
+                                                max_total_chars=1_100_000,
+                                                max_batch=4)
+        alphabet = _get_alphabet("even_a")
+        rng = random.Random(12345)
+
+        for length in (10_000, 100_000, 1_000_000):
+            s = "".join(rng.choice(alphabet) for _ in range(length))
+            gpu = engine.simulate_batch([s])[0]
+            cpu = simulate_sequential(dfa, s)
+            assert gpu == cpu, (
+                f"Long string L={length}: GPU={gpu} CPU={cpu}"
+            )
+
+        engine.destroy()
+
+    def test_timing(self, monoid_simulator):
+        """1000 strings of length 100 — verify kern_ms > 0 and total_ms >= kern_ms."""
+        dm, dfa = _make_dm("abb")
+        md = compute_monoid(dm)
+        assert md is not None
+
+        engine = monoid_simulator.create_engine(md, dm)
+        rng = random.Random(42)
+        alphabet = _get_alphabet("abb")
+        strings = [
+            "".join(rng.choice(alphabet) for _ in range(100))
+            for _ in range(1000)
+        ]
+
+        results, kern_ms, total_ms = engine.simulate_batch_timed(strings)
+
+        assert len(results) == 1000
+        assert kern_ms > 0, f"kern_ms should be > 0, got {kern_ms}"
+        assert total_ms >= kern_ms, (
+            f"total_ms ({total_ms}) should be >= kern_ms ({kern_ms})"
+        )
+        engine.destroy()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
