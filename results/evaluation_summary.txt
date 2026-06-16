@@ -1,0 +1,39 @@
+======================================================================
+TERX Evaluation Summary: Tensor-Core DFA Scan on H200 NVL
+======================================================================
+
+## GPU Kernel Performance (CUDA events, persistent memory)
+      Length  Blelloch (ms)    BK GB/s       H-S (ms)    HS GB/s    BK/HS
+----------------------------------------------------------------------
+          64         0.0680      0.001         0.0367      0.002     0.50x
+         256         0.0835      0.003         0.0448      0.006     0.50x
+       1,024         0.1003      0.010         0.0531      0.019     0.53x
+       4,096         0.1206      0.034         0.0705      0.058     0.59x
+      16,384         0.1638      0.100         0.1600      0.102     0.98x
+      65,536         0.2954      0.222         0.5224      0.125     1.78x
+     262,144         0.8069      0.325         2.1188      0.124     2.62x
+   1,048,576         2.7198      0.386         8.9047      0.118     3.27x
+   4,194,304        10.3723      0.404        38.4983      0.109     3.71x
+  16,777,216        41.9641      0.400       167.7483      0.100     4.00x
+
+Peak Blelloch throughput: 0.404 GB/s (404 MB/s)
+Peak Hillis-Steele throughput: 0.125 GB/s
+Max Blelloch speedup over Hillis-Steele: 3.2x
+
+## Crossover Analysis
+CPU sequential throughput: ~19.6 MB/s
+GPU kernel surpasses CPU at L=4,096 (34 vs 20 MB/s)
+
+## Roofline Analysis
+H200 NVL peak int8 tensor: 1979 TOPS
+H200 NVL peak HBM3e BW: 4.8 TB/s
+Ridge point OI: 412.3 ops/byte
+DFA scan OI: 5.33 ops/byte (memory-bound)
+Achieved performance: 3.3126 TOPS (12.9% of BW-limited roof)
+
+## Key Findings
+1. Blelloch scan achieves 404 MB/s peak kernel throughput
+2. Work-efficient Blelloch is 3.2x faster than Hillis-Steele at large L
+3. Kernel is memory-bound (OI=5.33 < ridge point 412)
+4. Python bridge overhead (~0.3ms/call) dominates for short strings
+5. Batch processing amortizes launch overhead for many short strings

@@ -1,0 +1,6 @@
+build/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.so
+*.o
