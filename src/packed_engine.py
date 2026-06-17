@@ -359,4 +359,5 @@ class PackedEngine:
             'NP': self._NP,
             'unified_alphabet_size': len(self._unified_alphabet),
             'regexes': list(self._regexes),
+            'backend': 'gpu' if self._gpu_engine is not None else 'cpu',
         }
