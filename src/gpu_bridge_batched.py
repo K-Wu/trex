@@ -34,24 +34,44 @@ class BatchedEvolutionEngine:
     """Wraps a persistent GPU engine context for one DFA using batched evolution."""
 
     def __init__(self, lib, dm: DFAMatrices,
-                 max_B: int = 65536, max_L: int = 4096):
+                 max_B: int = 65536, max_L: int = 4096,
+                 start_vec=None, accept_mask=None,
+                 trans_matrices=None, N=None, sigma=None,
+                 char_to_idx=None, alphabet=None):
         self.lib = lib
         self.dm = dm
 
-        N = dm.n_states
-        sigma = len(dm.alphabet)
-        start_state = dm.dfa.start
+        if N is not None:
+            _N = N
+        else:
+            _N = dm.n_states
+        if sigma is not None:
+            _sigma = sigma
+        else:
+            _sigma = len(dm.alphabet)
 
-        # Ensure contiguous int8 arrays for transition matrices and accept mask
-        trans = np.ascontiguousarray(dm.matrix_stack, dtype=np.int8)
-        accept = np.ascontiguousarray(dm.accept_mask, dtype=np.int8)
+        if trans_matrices is not None:
+            trans = np.ascontiguousarray(trans_matrices, dtype=np.int8)
+        else:
+            trans = np.ascontiguousarray(dm.matrix_stack, dtype=np.int8)
+
+        if accept_mask is not None:
+            accept = np.ascontiguousarray(accept_mask, dtype=np.int8)
+        else:
+            accept = np.ascontiguousarray(dm.accept_mask, dtype=np.int8)
+
+        if start_vec is not None:
+            sv = np.ascontiguousarray(start_vec, dtype=np.int8)
+        else:
+            sv = np.zeros(_N, dtype=np.int8)
+            sv[dm.dfa.start] = 1
 
         rc = self.lib.batched_engine_init(
-            N,
-            sigma,
+            _N,
+            _sigma,
             trans.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
             accept.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-            start_state,
+            sv.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
             max_B,
             max_L,
         )
@@ -59,9 +79,10 @@ class BatchedEvolutionEngine:
             raise RuntimeError(f"batched_engine_init failed with code {rc}")
 
         # Build char_to_idx lookup: int32[256], default to identity_idx (sigma)
-        self._identity_idx = sigma
+        self._identity_idx = _sigma
         self._char_to_idx = np.full(256, -1, dtype=np.int32)
-        for ch, idx in dm.char_to_idx.items():
+        _c2i = char_to_idx if char_to_idx is not None else dm.char_to_idx
+        for ch, idx in _c2i.items():
             self._char_to_idx[ord(ch)] = idx
 
     def destroy(self):
@@ -183,7 +204,7 @@ class BatchedGPUSimulator:
             ctypes.c_int,                     # sigma
             ctypes.POINTER(ctypes.c_int8),    # trans (sigma x N x N)
             ctypes.POINTER(ctypes.c_int8),    # accept (N)
-            ctypes.c_int,                     # start_state
+            ctypes.POINTER(ctypes.c_int8),    # start_vec (N)
             ctypes.c_int,                     # max_B
             ctypes.c_int,                     # max_L
         ]
@@ -226,3 +247,18 @@ class BatchedGPUSimulator:
                       max_B: int = 65536,
                       max_L: int = 4096) -> BatchedEvolutionEngine:
         return BatchedEvolutionEngine(self.lib, dm, max_B, max_L)
+
+    def create_packed_engine(self, packed_engine,
+                             max_B: int = 65536,
+                             max_L: int = 4096) -> BatchedEvolutionEngine:
+        pe = packed_engine
+        return BatchedEvolutionEngine(
+            self.lib, None,
+            max_B=max_B, max_L=max_L,
+            start_vec=pe._start_vec,
+            accept_mask=pe._accept_masks[0] if pe._n_patterns == 1 else None,
+            trans_matrices=pe._matrix_stack,
+            N=pe._NP,
+            sigma=len(pe._unified_alphabet),
+            char_to_idx=pe._unified_char_to_idx,
+        )

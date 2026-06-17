@@ -189,5 +189,84 @@ class TestTimedInterface:
         assert isinstance(timing, dict)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. GPU PackedEngine
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _packed_gpu_available():
+    try:
+        from src.gpu_bridge_batched import BatchedGPUSimulator
+        BatchedGPUSimulator()
+        return True
+    except Exception:
+        return False
+
+
+skip_no_gpu = pytest.mark.skipif(not _packed_gpu_available(), reason="GPU not available")
+
+
+def _cross_validate_gpu(regexes: list[str], strings: list[str]):
+    """Cross-validate PackedEngine GPU results against CPU."""
+    cpu = PackedEngine(regexes, use_gpu=False)
+    gpu = PackedEngine(regexes, use_gpu=True)
+
+    cpu_results = cpu.match_batch(strings)
+    gpu_results = gpu.match_batch(strings)
+
+    assert len(gpu_results) == len(regexes)
+    for p_idx in range(len(regexes)):
+        assert len(gpu_results[p_idx]) == len(strings)
+        for s_idx in range(len(strings)):
+            assert gpu_results[p_idx][s_idx] == cpu_results[p_idx][s_idx], (
+                f"GPU/CPU mismatch: pattern[{p_idx}]='{regexes[p_idx]}', "
+                f"string[{s_idx}]='{strings[s_idx][:60]}': "
+                f"gpu={gpu_results[p_idx][s_idx]} cpu={cpu_results[p_idx][s_idx]}"
+            )
+
+
+@skip_no_gpu
+class TestPackedEngineGPU:
+
+    def test_two_patterns_gpu(self):
+        regexes = ["(a|b)*abb", "(aa|b)*"]
+        rng = random.Random(42)
+        strings = [gen_random_string('ab', 64, rng) for _ in range(200)]
+        _cross_validate_gpu(regexes, strings)
+
+    def test_four_patterns_gpu(self):
+        regexes = ["(a|b)*abb", "(aa|b)*", "(ab)*", "(b*ab*ab*)*b*"]
+        rng = random.Random(99)
+        strings = [gen_random_string('ab', 128, rng) for _ in range(200)]
+        _cross_validate_gpu(regexes, strings)
+
+    def test_single_pattern_gpu(self):
+        regexes = ["(a|b)*abb"]
+        rng = random.Random(77)
+        strings = [gen_random_string('ab', 64, rng) for _ in range(100)]
+        _cross_validate_gpu(regexes, strings)
+
+    def test_variable_length_gpu(self):
+        regexes = ["(a|b)*abb", "(aa|b)*"]
+        strings = ["", "a", "ab", "abb", "aabb", "babb", "b", "aa", "bb",
+                    "ababababb", "", "aabbaabb", "bbbabb", "aaaa", "bbbb"]
+        _cross_validate_gpu(regexes, strings)
+
+    def test_gpu_timed(self):
+        pe = PackedEngine(["(a|b)*abb", "(aa|b)*"], use_gpu=True)
+        rng = random.Random(42)
+        strings = [gen_random_string('ab', 32, rng) for _ in range(100)]
+        results, timing = pe.match_batch_timed(strings)
+        assert len(results) == 2
+        assert len(results[0]) == 100
+        assert 'kernel_ms' in timing
+        assert 'total_ms' in timing
+
+    def test_gpu_large_batch(self):
+        regexes = ["(a|b)*abb", "(aa|b)*"]
+        rng = random.Random(123)
+        strings = [gen_random_string('ab', 256, rng) for _ in range(2000)]
+        _cross_validate_gpu(regexes, strings)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])

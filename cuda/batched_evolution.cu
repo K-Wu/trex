@@ -64,7 +64,7 @@ __global__ void batched_evolution_binary_kernel(
     const int8_t  *__restrict__ T1_global,     // [16*16] transition for char 1
     const uint8_t *__restrict__ input,          // [L][B_padded] position-contiguous
     const int8_t  *__restrict__ accept_mask,   // [16]
-    int start_state,
+    const int8_t *__restrict__ start_vec,      // [16] initial state vector
     int B,          // actual number of strings
     int B_padded,   // B rounded up to multiple of COLS_PER_BLOCK
     int L,          // max string length
@@ -98,7 +98,7 @@ __global__ void batched_evolution_binary_kernel(
     // start_state row = 1, all others = 0
     for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
         int row = e % TILE;
-        S_sh[e] = (row == start_state) ? (int8_t)1 : (int8_t)0;
+        S_sh[e] = start_vec[row];
     }
     __syncthreads();
 
@@ -186,7 +186,7 @@ __global__ void batched_evolution_general_kernel(
     const int8_t  *__restrict__ trans_matrices, // [sigma][16][16] row-major per matrix
     const uint8_t *__restrict__ input,           // [L][B_padded]
     const int8_t  *__restrict__ accept_mask,    // [16]
-    int start_state,
+    const int8_t  *__restrict__ start_vec,     // [16] initial state vector
     int sigma,       // alphabet size
     int B,
     int B_padded,
@@ -210,10 +210,10 @@ __global__ void batched_evolution_general_kernel(
     int32_t *acc_sh  = acc_base + warp_in_block * TILE_ELEMS;
     int8_t  *S_tmp   = Stmp_base + warp_in_block * TILE_ELEMS;
 
-    // Initialize S to start state vector (col-major)
+    // Initialize S from start vector (col-major)
     for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
         int row = e % TILE;
-        S_sh[e] = (row == start_state) ? (int8_t)1 : (int8_t)0;
+        S_sh[e] = start_vec[row];
     }
     __syncthreads();
 
@@ -311,24 +311,193 @@ __global__ void batched_evolution_general_kernel(
 }
 
 
+// ---- Multi-Tile Kernel (NP > 16) -----------------------------------------
+//
+// For packed engines with NP = k*16 (k > 1) state dimensions.
+// Each block handles 16 columns (one column-tile of S).
+// NP_tiles warps per block, each warp computes one 16-row block of the output.
+// S is stored col-major with leading dimension NP: S[col * NP + row].
+// Double-buffered S (S_A / S_B) to avoid a copy step.
+//
+// Shared memory layout:
+//   S_A[16 * NP]              -- state buffer A (col-major, ldm=NP)
+//   S_B[16 * NP]              -- state buffer B
+//   acc[NP_tiles * 256]       -- int32 accumulators (one 16x16 per warp)
+//   Total: 32*NP + (NP/16)*1024 = 96*NP bytes
+
+__global__ void batched_evolution_multitile_kernel(
+    const int8_t  *__restrict__ T_all,         // [sigma, NP, NP] row-major per matrix
+    const uint8_t *__restrict__ input,         // [L, B_padded]
+    const int8_t  *__restrict__ accept_mask,   // [NP] (used only when states_out == NULL)
+    const int8_t  *__restrict__ start_vec,     // [NP]
+    int *__restrict__ results,                 // [B] (used only when states_out == NULL)
+    int8_t *__restrict__ states_out,           // [NP, B_padded] or NULL
+    int B, int B_padded, int L, int NP, int sigma, int NP_tiles
+) {
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int col_start = blockIdx.x * TILE;
+    int tpb = NP_tiles * WARP_SIZE;
+
+    extern __shared__ char smem_mt[];
+    int8_t  *S_A = (int8_t *)smem_mt;
+    int8_t  *S_B = S_A + 16 * NP;
+    int32_t *acc_base = (int32_t *)(S_B + 16 * NP);
+    int32_t *my_acc = acc_base + warp_id * TILE_ELEMS;
+
+    int my_row = warp_id * TILE;
+
+    // Initialize S_A from start_vec (all threads cooperate)
+    for (int e = threadIdx.x; e < 16 * NP; e += tpb) {
+        int row = e % NP;
+        S_A[e] = start_vec[row];
+    }
+    __syncthreads();
+
+    int8_t *S_cur = S_A;
+    int8_t *S_nxt = S_B;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> frag_T;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> frag_S;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> frag_acc;
+
+    for (int t = 0; t < L; t++) {
+        // Read column chars (lanes 0..15 each get one column's char)
+        uint8_t col_char = (uint8_t)sigma;
+        if (lane < TILE) {
+            int sid = col_start + lane;
+            if (sid < B_padded)
+                col_char = input[t * B_padded + sid];
+        }
+
+        // Clear this warp's row-block portion of S_nxt
+        for (int e = lane; e < 16 * TILE; e += WARP_SIZE) {
+            int local_col = e / TILE;
+            int local_row = e % TILE;
+            S_nxt[local_col * NP + my_row + local_row] = 0;
+        }
+        __syncwarp();
+
+        for (int c = 0; c < sigma; c++) {
+            unsigned has_c = __ballot_sync(0xFFFFFFFF, (lane < TILE) && (col_char == c));
+            if (has_c == 0) continue;
+
+            // output[my_row_block] = sum_k T[c][warp_id][k] * S_cur[k]
+            wmma::fill_fragment(frag_acc, 0);
+            for (int k = 0; k < NP_tiles; k++) {
+                const int8_t *T_block = T_all + c * NP * NP + my_row * NP + k * TILE;
+                wmma::load_matrix_sync(frag_T, T_block, NP);
+                wmma::load_matrix_sync(frag_S, &S_cur[k * TILE], NP);
+                wmma::mma_sync(frag_acc, frag_T, frag_S, frag_acc);
+            }
+
+            wmma::store_matrix_sync(my_acc, frag_acc, TILE, wmma::mem_row_major);
+            __syncwarp();
+
+            // Threshold and write to S_nxt for columns matching char c
+            for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+                int local_row = e / TILE;
+                int local_col = e % TILE;
+                uint8_t this_char = __shfl_sync(0xFFFFFFFF, col_char, local_col);
+                if (this_char == (uint8_t)c) {
+                    int32_t val = my_acc[e];
+                    S_nxt[local_col * NP + my_row + local_row] = (int8_t)(val > 0 ? 1 : 0);
+                }
+            }
+            __syncwarp();
+        }
+
+        // Identity columns: copy from S_cur
+        for (int e = lane; e < 16 * TILE; e += WARP_SIZE) {
+            int local_col = e / TILE;
+            int local_row = e % TILE;
+            uint8_t this_char = __shfl_sync(0xFFFFFFFF, col_char, local_col);
+            if (this_char >= (uint8_t)sigma) {
+                S_nxt[local_col * NP + my_row + local_row] =
+                    S_cur[local_col * NP + my_row + local_row];
+            }
+        }
+        __syncthreads();
+
+        // Double-buffer swap
+        int8_t *tmp = S_cur; S_cur = S_nxt; S_nxt = tmp;
+    }
+
+    if (states_out != nullptr) {
+        // Write final state to global memory: states_out[row * B_padded + sid]
+        for (int e = lane; e < 16 * TILE; e += WARP_SIZE) {
+            int local_col = e / TILE;
+            int local_row = e % TILE;
+            int sid = col_start + local_col;
+            if (sid < B_padded) {
+                states_out[(my_row + local_row) * B_padded + sid] =
+                    S_cur[local_col * NP + my_row + local_row];
+            }
+        }
+    } else {
+        // Single-pattern accept check
+        if (warp_id == 0) {
+            for (int col = lane; col < TILE; col += WARP_SIZE) {
+                int sid = col_start + col;
+                if (sid >= B) continue;
+                int accepted = 0;
+                for (int r = 0; r < NP; r++) {
+                    if (S_cur[col * NP + r] > 0 && accept_mask[r] != 0) {
+                        accepted = 1;
+                        break;
+                    }
+                }
+                results[sid] = accepted;
+            }
+        }
+    }
+}
+
+
+// ---- Multi-Pattern Accept Check Kernel -----------------------------------
+
+__global__ void multi_accept_check_kernel(
+    const int8_t *__restrict__ states,        // [NP, B_padded]
+    const int8_t *__restrict__ accept_masks,  // [n_patterns, NP]
+    int *__restrict__ results,                // [n_patterns * B]
+    int B, int B_padded, int NP, int n_patterns
+) {
+    int sid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sid >= B) return;
+    for (int p = 0; p < n_patterns; p++) {
+        int accepted = 0;
+        for (int r = 0; r < NP; r++) {
+            if (states[r * B_padded + sid] > 0 && accept_masks[p * NP + r] != 0) {
+                accepted = 1;
+                break;
+            }
+        }
+        results[p * B + sid] = accepted;
+    }
+}
+
+
 // ---- Engine Struct --------------------------------------------------------
 
 struct BatchedEngine {
-    int N;           // number of DFA states (padded to 16)
+    int N;           // number of DFA states (padded to multiple of 16)
     int sigma;       // alphabet size
-    int start_state;
     int max_B;
     int max_L;
 
     // Host copies
-    int8_t *h_accept_mask;     // [16]
-    int8_t *h_trans_matrices;  // [sigma * 256]
+    int8_t *h_accept_mask;     // [N]
+    int8_t *h_trans_matrices;  // [sigma * N * N]
+    int8_t *h_start_vec;       // [N]
 
     // Device memory
-    int8_t  *d_trans;          // [sigma * 256]
-    int8_t  *d_accept;         // [16]
+    int8_t  *d_trans;          // [sigma * N * N]
+    int8_t  *d_accept;         // [N]
+    int8_t  *d_start_vec;      // [N]
     uint8_t *d_input;          // [max_L * B_padded_max]
-    int     *d_results;        // [max_B]
+    int     *d_results;        // [max_B] (or larger for multi-pattern)
+    int8_t  *d_states;         // [N * B_padded_max] for multi-pattern state output
+    int      max_results;      // current d_results capacity
 
     int B_padded_max;          // max_B rounded up to COLS_PER_BLOCK
 
@@ -339,26 +508,31 @@ struct BatchedEngine {
     bool initialized;
 
     void init(int n, int sig, const int8_t *trans, const int8_t *accept,
-              int start_st, int maxB, int maxL) {
+              const int8_t *start_vec, int maxB, int maxL) {
         N = n;
         sigma = sig;
-        start_state = start_st;
         max_B = maxB;
         max_L = maxL;
         B_padded_max = ((maxB + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
 
-        h_accept_mask = new int8_t[TILE];
-        h_trans_matrices = new int8_t[sig * TILE_ELEMS];
-        memcpy(h_accept_mask, accept, TILE);
-        memcpy(h_trans_matrices, trans, sig * TILE_ELEMS);
+        h_accept_mask = new int8_t[N];
+        h_trans_matrices = new int8_t[sig * N * N];
+        h_start_vec = new int8_t[N];
+        memcpy(h_accept_mask, accept, N);
+        memcpy(h_trans_matrices, trans, sig * N * N);
+        memcpy(h_start_vec, start_vec, N);
 
-        CHECK_CUDA(cudaMalloc(&d_trans, sig * TILE_ELEMS));
-        CHECK_CUDA(cudaMalloc(&d_accept, TILE));
+        CHECK_CUDA(cudaMalloc(&d_trans, sig * N * N));
+        CHECK_CUDA(cudaMalloc(&d_accept, N));
+        CHECK_CUDA(cudaMalloc(&d_start_vec, N));
         CHECK_CUDA(cudaMalloc(&d_input, (size_t)maxL * B_padded_max));
         CHECK_CUDA(cudaMalloc(&d_results, (size_t)maxB * sizeof(int)));
+        d_states = nullptr;
+        max_results = maxB;
 
-        CHECK_CUDA(cudaMemcpy(d_trans, trans, sig * TILE_ELEMS, cudaMemcpyHostToDevice));
-        CHECK_CUDA(cudaMemcpy(d_accept, accept, TILE, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_trans, trans, sig * N * N, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_accept, accept, N, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_start_vec, start_vec, N, cudaMemcpyHostToDevice));
 
         CHECK_CUDA(cudaEventCreate(&ev_start));
         CHECK_CUDA(cudaEventCreate(&ev_stop));
@@ -372,10 +546,13 @@ struct BatchedEngine {
         if (!initialized) return;
         delete[] h_accept_mask;
         delete[] h_trans_matrices;
+        delete[] h_start_vec;
         cudaFree(d_trans);
         cudaFree(d_accept);
+        cudaFree(d_start_vec);
         cudaFree(d_input);
         cudaFree(d_results);
+        if (d_states) cudaFree(d_states);
         cudaEventDestroy(ev_start);
         cudaEventDestroy(ev_stop);
         cudaEventDestroy(ev_kern_start);
@@ -395,41 +572,37 @@ struct BatchedEngine {
         size_t input_bytes = (size_t)L * B_padded;
         CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
 
-        int n_blocks = B_padded / COLS_PER_BLOCK;
-
         CHECK_CUDA(cudaEventRecord(ev_kern_start));
 
-        if (sigma == 2) {
-            // Binary kernel
-            // Shared memory: 256 (T0) + 256 (T1) + 4*256 (S) + 4*1024 (acc0) + 4*1024 (acc1)
-            int smem = 2 * TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS
-                       + 2 * WARPS_PER_BLOCK * TILE_ELEMS * (int)sizeof(int32_t);
-            batched_evolution_binary_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
-                d_trans,                      // T0
-                d_trans + TILE_ELEMS,         // T1
-                d_input,
-                d_accept,
-                start_state,
-                B, B_padded, L,
-                d_results);
+        if (N <= TILE) {
+            // Single-tile kernels (N=16)
+            int n_blocks = B_padded / COLS_PER_BLOCK;
+
+            if (sigma == 2) {
+                int smem = 2 * TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS
+                           + 2 * WARPS_PER_BLOCK * TILE_ELEMS * (int)sizeof(int32_t);
+                batched_evolution_binary_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                    d_trans, d_trans + TILE_ELEMS,
+                    d_input, d_accept, d_start_vec,
+                    B, B_padded, L, d_results);
+            } else {
+                int smem = WARPS_PER_BLOCK * TILE_ELEMS
+                           + WARPS_PER_BLOCK * TILE_ELEMS
+                           + WARPS_PER_BLOCK * TILE_ELEMS * (int)sizeof(int32_t)
+                           + WARPS_PER_BLOCK * TILE_ELEMS;
+                batched_evolution_general_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                    d_trans, d_input, d_accept, d_start_vec,
+                    sigma, B, B_padded, L, sigma, d_results);
+            }
         } else {
-            // General kernel
-            // Shared memory: 4*256 (T) + 4*256 (S) + 4*1024 (acc) + 4*256 (S_tmp)
-            // identity_idx = sigma (one past last valid char)
-            int identity_idx = sigma;
-            int smem = WARPS_PER_BLOCK * TILE_ELEMS
-                       + WARPS_PER_BLOCK * TILE_ELEMS
-                       + WARPS_PER_BLOCK * TILE_ELEMS * (int)sizeof(int32_t)
-                       + WARPS_PER_BLOCK * TILE_ELEMS;
-            batched_evolution_general_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
-                d_trans,
-                d_input,
-                d_accept,
-                start_state,
-                sigma,
-                B, B_padded, L,
-                identity_idx,
-                d_results);
+            // Multi-tile kernel (NP > 16)
+            int NP_tiles = N / TILE;
+            int threads = NP_tiles * WARP_SIZE;
+            int n_blocks_mt = B_padded / TILE;
+            int smem = 32 * N + NP_tiles * TILE_ELEMS * (int)sizeof(int32_t);
+            batched_evolution_multitile_kernel<<<n_blocks_mt, threads, smem>>>(
+                d_trans, d_input, d_accept, d_start_vec,
+                d_results, nullptr, B, B_padded, L, N, sigma, NP_tiles);
         }
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaEventRecord(ev_kern_stop));
@@ -440,6 +613,76 @@ struct BatchedEngine {
 
         CHECK_CUDA(cudaEventRecord(ev_stop));
         CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
+        if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
+
+        return 0;
+    }
+
+    // Multi-pattern dispatch: evolves state, then checks P accept masks
+    int dispatch_multi(const uint8_t *h_input, int B, int L, int B_padded,
+                       const int8_t *h_accept_masks, int n_patterns,
+                       int *h_results, float *kernel_ms, float *total_ms) {
+        if (!initialized) return -1;
+
+        CHECK_CUDA(cudaEventRecord(ev_start));
+
+        // H2D: input
+        size_t input_bytes = (size_t)L * B_padded;
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
+
+        // Ensure d_results is large enough for n_patterns * B
+        int needed = n_patterns * B;
+        if (needed > max_results) {
+            cudaFree(d_results);
+            CHECK_CUDA(cudaMalloc(&d_results, (size_t)needed * sizeof(int)));
+            max_results = needed;
+        }
+
+        // Allocate/reallocate d_states if needed
+        size_t states_bytes = (size_t)N * B_padded;
+        if (d_states == nullptr) {
+            CHECK_CUDA(cudaMalloc(&d_states, states_bytes));
+        }
+
+        // Upload accept masks
+        int8_t *d_accept_masks;
+        CHECK_CUDA(cudaMalloc(&d_accept_masks, (size_t)n_patterns * N));
+        CHECK_CUDA(cudaMemcpy(d_accept_masks, h_accept_masks,
+                              n_patterns * N, cudaMemcpyHostToDevice));
+
+        CHECK_CUDA(cudaEventRecord(ev_kern_start));
+
+        // Always use multi-tile kernel for multi-pattern dispatch
+        int NP_tiles = N / TILE;
+        int threads = NP_tiles * WARP_SIZE;
+        int n_blocks_mt = B_padded / TILE;
+        int smem = 32 * N + NP_tiles * TILE_ELEMS * (int)sizeof(int32_t);
+        batched_evolution_multitile_kernel<<<n_blocks_mt, threads, smem>>>(
+            d_trans, d_input, d_accept, d_start_vec,
+            d_results, d_states, B, B_padded, L, N, sigma, NP_tiles);
+        CHECK_CUDA(cudaGetLastError());
+
+        // Accept check kernel
+        int acc_threads = 256;
+        int acc_blocks = (B + acc_threads - 1) / acc_threads;
+        multi_accept_check_kernel<<<acc_blocks, acc_threads>>>(
+            d_states, d_accept_masks, d_results,
+            B, B_padded, N, n_patterns);
+        CHECK_CUDA(cudaGetLastError());
+
+        CHECK_CUDA(cudaEventRecord(ev_kern_stop));
+
+        // D2H: results
+        CHECK_CUDA(cudaMemcpy(h_results, d_results,
+                              (size_t)n_patterns * B * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+
+        CHECK_CUDA(cudaEventRecord(ev_stop));
+        CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        cudaFree(d_accept_masks);
 
         if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
         if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
@@ -472,10 +715,10 @@ int batched_engine_device_check() {
 int batched_engine_init(int N, int sigma,
                         const int8_t *trans_matrices,  // [sigma, N, N] row-major
                         const int8_t *accept_mask,     // [N]
-                        int start_state,
+                        const int8_t *start_vec,       // [N] initial state vector
                         int max_B, int max_L) {
     if (g_engine.initialized) g_engine.destroy();
-    g_engine.init(N, sigma, trans_matrices, accept_mask, start_state, max_B, max_L);
+    g_engine.init(N, sigma, trans_matrices, accept_mask, start_vec, max_B, max_L);
     return 0;
 }
 
@@ -489,6 +732,20 @@ int batched_engine_dispatch(const uint8_t *input,  // [L, B_padded]
                             float *kernel_ms, float *total_ms) {
     int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
     return g_engine.dispatch(input, B, L, B_padded, results, kernel_ms, total_ms);
+}
+
+int batched_engine_dispatch_multi(
+    const uint8_t *input,              // [L, B_padded]
+    int B, int L,
+    const int8_t *accept_masks,        // [n_patterns, N]
+    int n_patterns,
+    int *results,                      // [n_patterns * B]
+    float *kernel_ms, float *total_ms)
+{
+    int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+    return g_engine.dispatch_multi(input, B, L, B_padded,
+                                   accept_masks, n_patterns,
+                                   results, kernel_ms, total_ms);
 }
 
 // C-accelerated batch preparation: transpose from [string][position] to [position][B_padded]
@@ -533,35 +790,36 @@ static void check(const char *name, bool cond) {
 
 // Sequential reference simulation for a single string
 static bool simulate_sequential(
-    int n_states, int start_state,
+    int N, const int8_t *start_vec,
     const int8_t *accept_mask, const int8_t *trans_matrices,
     const uint8_t *chars, int L, int identity_idx
 ) {
-    if (L == 0) return accept_mask[start_state] != 0;
+    std::vector<int8_t> state(N), new_state(N);
+    memcpy(state.data(), start_vec, N);
 
-    // State vector
-    int8_t state[TILE];
-    memset(state, 0, TILE);
-    state[start_state] = 1;
+    if (L == 0) {
+        for (int r = 0; r < N; r++)
+            if (state[r] > 0 && accept_mask[r] != 0) return true;
+        return false;
+    }
 
     for (int t = 0; t < L; t++) {
         int c = chars[t];
-        if (c == identity_idx) continue;  // identity: no change
+        if (c == identity_idx) continue;
 
-        const int8_t *T = trans_matrices + c * TILE_ELEMS;
-        int8_t new_state[TILE];
-        memset(new_state, 0, TILE);
-        for (int row = 0; row < TILE; row++) {
+        const int8_t *T = trans_matrices + c * N * N;
+        memset(new_state.data(), 0, N);
+        for (int row = 0; row < N; row++) {
             int32_t sum = 0;
-            for (int k = 0; k < TILE; k++) {
-                sum += (int32_t)T[row * TILE + k] * (int32_t)state[k];
+            for (int k = 0; k < N; k++) {
+                sum += (int32_t)T[row * N + k] * (int32_t)state[k];
             }
             new_state[row] = (int8_t)(sum > 0 ? 1 : 0);
         }
-        memcpy(state, new_state, TILE);
+        memcpy(state.data(), new_state.data(), N);
     }
 
-    for (int r = 0; r < TILE; r++)
+    for (int r = 0; r < N; r++)
         if (state[r] > 0 && accept_mask[r] != 0) return true;
     return false;
 }
@@ -598,10 +856,15 @@ static void test_binary_even_a() {
     printf("\n--- test_binary_even_a ---\n");
     EvenADFA dfa;
 
+    // Build start_vec: state 0 = 1, rest = 0
+    int8_t start_vec[TILE];
+    memset(start_vec, 0, TILE);
+    start_vec[0] = 1;
+
     int max_B = 64;
     int max_L = 256;
     BatchedEngine eng;
-    eng.init(2, 2, dfa.trans, dfa.accept, 0, max_B, max_L);
+    eng.init(TILE, 2, dfa.trans, dfa.accept, start_vec, max_B, max_L);
 
     // identity_idx = 2 (for binary, sigma=2)
     int identity_idx = 2;
@@ -670,6 +933,9 @@ static void test_binary_even_a() {
 static void test_large_batch_binary() {
     printf("\n--- test_large_batch_binary (1024 strings x 128 chars) ---\n");
     EvenADFA dfa;
+    int8_t start_vec[TILE];
+    memset(start_vec, 0, TILE);
+    start_vec[0] = 1;
 
     int B = 1024;
     int L = 128;
@@ -677,7 +943,7 @@ static void test_large_batch_binary() {
     int identity_idx = 2;
 
     BatchedEngine eng;
-    eng.init(2, 2, dfa.trans, dfa.accept, 0, B_padded, L);
+    eng.init(TILE, 2, dfa.trans, dfa.accept, start_vec, B_padded, L);
 
     // Generate random binary input
     srand(42);
@@ -716,7 +982,7 @@ static void test_large_batch_binary() {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < L; t++)
             str_chars[t] = input[t * B_padded + b];
-        bool seq = simulate_sequential(2, 0, dfa.accept, dfa.trans,
+        bool seq = simulate_sequential(TILE, start_vec, dfa.accept, dfa.trans,
                                         str_chars, L, identity_idx);
         if (results[b] != (seq ? 1 : 0)) seq_mismatches++;
     }
@@ -767,13 +1033,17 @@ static void test_general_kernel() {
     trans[2 * TILE_ELEMS + 0 * TILE + 1] = 1;
     trans[2 * TILE_ELEMS + 1 * TILE + 2] = 1;
 
+    int8_t start_vec[TILE];
+    memset(start_vec, 0, TILE);
+    start_vec[0] = 1;
+
     int identity_idx = sigma;  // 3
     int B = 64;
     int L = 16;
     int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
 
     BatchedEngine eng;
-    eng.init(3, sigma, trans, accept, 0, B_padded, L);
+    eng.init(TILE, sigma, trans, accept, start_vec, B_padded, L);
 
     // Generate random input
     srand(99);
@@ -796,7 +1066,7 @@ static void test_general_kernel() {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < L; t++)
             str_chars[t] = input[t * B_padded + b];
-        bool seq = simulate_sequential(3, 0, accept, trans,
+        bool seq = simulate_sequential(TILE, start_vec, accept, trans,
                                         str_chars, L, identity_idx);
         if (results[b] != (seq ? 1 : 0)) mismatches++;
     }
@@ -856,6 +1126,9 @@ static void test_prepare_input() {
 static void bench_throughput() {
     printf("\n=== Throughput Benchmark (binary kernel) ===\n");
     EvenADFA dfa;
+    int8_t start_vec[TILE];
+    memset(start_vec, 0, TILE);
+    start_vec[0] = 1;
 
     int batch_sizes[] = {64, 256, 1024, 4096, 16384, 65536};
     int lengths[]     = {32, 128, 512, 2048};
@@ -872,7 +1145,7 @@ static void bench_throughput() {
             int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
 
             BatchedEngine eng;
-            eng.init(2, 2, dfa.trans, dfa.accept, 0, B_padded, L);
+            eng.init(TILE, 2, dfa.trans, dfa.accept, start_vec, B_padded, L);
 
             // Generate random input
             srand(42);
