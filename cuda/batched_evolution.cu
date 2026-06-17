@@ -496,7 +496,8 @@ struct BatchedEngine {
     int8_t  *d_start_vec;      // [N]
     uint8_t *d_input;          // [max_L * B_padded_max]
     int     *d_results;        // [max_B] (or larger for multi-pattern)
-    int8_t  *d_states;         // [N * B_padded_max] for multi-pattern state output
+    int8_t  *d_states;         // [N * B_padded] for multi-pattern state output
+    size_t   d_states_bytes;   // current d_states allocation size
     int      max_results;      // current d_results capacity
 
     int B_padded_max;          // max_B rounded up to COLS_PER_BLOCK
@@ -528,6 +529,7 @@ struct BatchedEngine {
         CHECK_CUDA(cudaMalloc(&d_input, (size_t)maxL * B_padded_max));
         CHECK_CUDA(cudaMalloc(&d_results, (size_t)maxB * sizeof(int)));
         d_states = nullptr;
+        d_states_bytes = 0;
         max_results = maxB;
 
         CHECK_CUDA(cudaMemcpy(d_trans, trans, sig * N * N, cudaMemcpyHostToDevice));
@@ -642,8 +644,10 @@ struct BatchedEngine {
 
         // Allocate/reallocate d_states if needed
         size_t states_bytes = (size_t)N * B_padded;
-        if (d_states == nullptr) {
+        if (states_bytes > d_states_bytes) {
+            if (d_states) cudaFree(d_states);
             CHECK_CUDA(cudaMalloc(&d_states, states_bytes));
+            d_states_bytes = states_bytes;
         }
 
         // Upload accept masks
