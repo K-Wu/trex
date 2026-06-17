@@ -216,6 +216,8 @@ class TestAllConfigsSameResult:
         configs = [None, "monoid", "monoid+kgram", "baseline", "nfa"]
         if _gpu_available():
             configs.append("monoid+gpu")
+        if _kgram_gpu_available():
+            configs.append("kgram+gpu")
         results_per_config = {}
 
         for cfg in configs:
@@ -251,6 +253,15 @@ def _gpu_available():
 
 
 skip_no_gpu = pytest.mark.skipif(not _gpu_available(), reason="GPU not available")
+
+
+def _kgram_gpu_available():
+    try:
+        from src.gpu_bridge_kgram import KGramGPUSimulator
+        KGramGPUSimulator()
+        return True
+    except Exception:
+        return False
 
 
 @skip_no_gpu
@@ -340,3 +351,55 @@ class TestBatchedEvolutionIntegration:
         expected = engine_base.match_batch(strings)
         actual = engine_batched.match_batch(strings)
         assert actual == expected, f"batched+gpu mismatch for {pattern_name}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. K-gram GPU Integration
+# ═══════════════════════════════════════════════════════════════════════════
+
+skip_no_kgram_gpu = pytest.mark.skipif(
+    not _kgram_gpu_available(), reason="K-gram GPU not available"
+)
+
+
+@skip_no_kgram_gpu
+class TestKGramGPUIntegration:
+
+    @pytest.mark.parametrize("pattern_name",
+        ['abb', 'binary_div3', 'even_a', 'ab_star'])
+    def test_kgram_gpu_matches_baseline(self, pattern_name):
+        pat = PATTERNS[pattern_name]
+        engine_base = OptimizedEngine(pat.regex, config="baseline")
+        engine_kgram = OptimizedEngine(pat.regex, config="kgram+gpu")
+
+        strings = _random_strings(pattern_name, 500, seed=42)
+        expected = engine_base.match_batch(strings)
+        actual = engine_kgram.match_batch(strings)
+        assert actual == expected, f"kgram+gpu mismatch for {pattern_name}"
+
+    def test_kgram_gpu_config_info(self):
+        engine = OptimizedEngine("(a|b)*abb", config="kgram+gpu")
+        info = engine.config_info
+        assert info["scan_backend"] == "kgram+gpu"
+        assert info["kgram_k"] is not None
+        assert info["kgram_k"] >= 1
+
+    def test_kgram_gpu_timed(self):
+        engine = OptimizedEngine("(a|b)*abb", config="kgram+gpu")
+        strings = _random_strings("abb", 200, seed=42)
+        results, timing = engine.match_batch_timed(strings)
+        assert isinstance(results, list)
+        assert len(results) == 200
+        assert "kernel_ms" in timing
+        assert "total_ms" in timing
+
+    @pytest.mark.parametrize("pattern_name", ["hex_number", "identifier"])
+    def test_kgram_gpu_larger_alphabet(self, pattern_name):
+        pat = PATTERNS[pattern_name]
+        engine_base = OptimizedEngine(pat.regex, config="baseline")
+        engine_kgram = OptimizedEngine(pat.regex, config="kgram+gpu")
+
+        strings = _random_strings(pattern_name, 200, seed=99)
+        expected = engine_base.match_batch(strings)
+        actual = engine_kgram.match_batch(strings)
+        assert actual == expected, f"kgram+gpu mismatch for {pattern_name}"

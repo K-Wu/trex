@@ -22,7 +22,7 @@ from typing import Optional
 from src.regex_to_dfa import compile_regex
 from src.simulation import DFAMatrices, simulate_sequential
 from src.monoid import compute_monoid, simulate_monoid
-from src.kgram import precompute_kgrams, simulate_kgram_monoid, auto_k
+from src.kgram import precompute_kgrams, simulate_kgram_monoid, auto_k, auto_k_for_gpu
 from src.nfa_matrices import compile_nfa_matrices, simulate_nfa
 
 
@@ -66,6 +66,7 @@ class OptimizedEngine:
         self._nm = None       # NFAMatrices
         self._gpu_engine = None  # MonoidEngine (GPU)
         self._batched_gpu = None  # BatchedEvolutionEngine (GPU)
+        self._kgram_gpu = None  # KGramGPUEngine (GPU)
 
         self._representation = None   # "dfa" | "nfa"
         self._scan_backend = None     # "sequential" | "monoid" | "monoid+kgram" | "nfa"
@@ -88,10 +89,13 @@ class OptimizedEngine:
         elif config == "batched+gpu":
             self._force_baseline()
             self._setup_batched_gpu()
+        elif config == "kgram+gpu":
+            self._force_baseline()
+            self._setup_kgram_gpu()
         else:
             raise ValueError(f"Unknown config: {config!r}. "
                              f"Choose from None, 'monoid', 'monoid+kgram', 'baseline', 'nfa', "
-                             f"'monoid+gpu', 'batched+gpu'.")
+                             f"'monoid+gpu', 'batched+gpu', 'kgram+gpu'.")
 
     # ── Private setup helpers ────────────────────────────────────────────────
 
@@ -200,6 +204,20 @@ class OptimizedEngine:
         self._scan_backend = 'batched+gpu'
         self._selection_reason = 'GPU batched state-vector evolution'
 
+    def _setup_kgram_gpu(self):
+        self._build_dfa()
+        from src.gpu_bridge_kgram import KGramGPUSimulator
+        sigma = len(self._dfa.alphabet)
+        k = auto_k_for_gpu(sigma, self._dm.n_states)
+        sim = KGramGPUSimulator()
+        self._kgram_gpu = sim.create_engine(self._dm, k)
+        self._kgram_k = k
+        self._scan_backend = 'kgram+gpu'
+        self._selection_reason = (
+            f'GPU k-gram TC (k={k}, table={sigma**k} entries, '
+            f'N={self._dm.n_states})'
+        )
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -249,6 +267,8 @@ class OptimizedEngine:
         """Match a list of strings. Returns list[bool]."""
         if self._gpu_engine is not None:
             return self._gpu_engine.simulate_batch(strings)
+        if self._kgram_gpu is not None:
+            return self._kgram_gpu.simulate_batch(strings)
         if self._batched_gpu is not None:
             return self._batched_gpu.simulate_batch(strings)
         return [self._match_one(s) for s in strings]
@@ -261,6 +281,9 @@ class OptimizedEngine:
         """
         if self._gpu_engine is not None:
             results, kern_ms, total_ms = self._gpu_engine.simulate_batch_timed(strings)
+            return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
+        if self._kgram_gpu is not None:
+            results, kern_ms, total_ms = self._kgram_gpu.simulate_batch_timed(strings)
             return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
         if self._batched_gpu is not None:
             results, kern_ms, total_ms = self._batched_gpu.simulate_batch_timed(strings)

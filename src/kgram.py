@@ -40,6 +40,26 @@ def auto_k(alphabet_size: int, max_entries: int = 65536) -> int:
         k += 1
 
 
+def auto_k_for_gpu(
+    alphabet_size: int,
+    n_states: int,
+    max_table_bytes: int = 48_000_000,
+) -> int:
+    """Return the largest k such that alphabet_size^k * n_states^2 <= max_table_bytes.
+
+    Targets GPU L2 cache budget. Each k-gram table entry is an n_states×n_states
+    int8 matrix (n_states^2 bytes). Total table size = alphabet_size^k * n_states^2.
+    """
+    if alphabet_size <= 1:
+        return 1
+    matrix_bytes = n_states * n_states
+    k = 1
+    while True:
+        if alphabet_size ** (k + 1) * matrix_bytes > max_table_bytes:
+            return k
+        k += 1
+
+
 # ─── KGramTable ─────────────────────────────────────────────────────────────
 
 class KGramTable:

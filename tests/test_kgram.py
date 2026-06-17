@@ -26,6 +26,7 @@ from src.generate_data import PATTERNS
 from src.monoid import compute_monoid, MonoidData
 from src.kgram import (
     auto_k,
+    auto_k_for_gpu,
     KGramTable,
     precompute_kgrams,
     simulate_kgram_monoid,
@@ -309,6 +310,51 @@ class TestKGramMatrixMode:
                 for s, e, g in mismatches[:10]
             )
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. TestAutoKForGPU
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAutoKForGPU:
+
+    def test_binary_n16(self):
+        k = auto_k_for_gpu(2, 16)
+        assert k == 17
+
+    def test_binary_n32(self):
+        k = auto_k_for_gpu(2, 32)
+        assert k == 15
+
+    def test_quad_n16(self):
+        k = auto_k_for_gpu(4, 16)
+        assert k == 8
+
+    def test_byte_n16(self):
+        k = auto_k_for_gpu(256, 16)
+        assert k == 2
+
+    def test_byte_n64(self):
+        k = auto_k_for_gpu(256, 64)
+        assert k == 1
+
+    def test_custom_budget(self):
+        k = auto_k_for_gpu(2, 16, max_table_bytes=1_048_576)
+        assert k == 12
+
+    def test_monotone_in_sigma(self):
+        prev_k = auto_k_for_gpu(2, 16)
+        for sigma in [4, 8, 16, 64, 256]:
+            k = auto_k_for_gpu(sigma, 16)
+            assert k <= prev_k, f"auto_k_for_gpu({sigma}, 16)={k} > prev={prev_k}"
+            prev_k = k
+
+    def test_monotone_in_n(self):
+        prev_k = auto_k_for_gpu(2, 16)
+        for n in [32, 48, 64]:
+            k = auto_k_for_gpu(2, n)
+            assert k <= prev_k, f"auto_k_for_gpu(2, {n})={k} > prev={prev_k}"
+            prev_k = k
 
 
 if __name__ == "__main__":

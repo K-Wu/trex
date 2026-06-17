@@ -33,7 +33,11 @@ SRC_BATCHED = $(CUDA_DIR)/batched_evolution.cu
 EXE_BATCHED = $(BUILD_DIR)/batched_evolution
 LIB_BATCHED = $(BUILD_DIR)/libbatched_evolution.so
 
-all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID) $(EXE_BATCHED) $(LIB_BATCHED)
+SRC_KGRAM = $(CUDA_DIR)/kgram_evolution.cu
+EXE_KGRAM = $(BUILD_DIR)/kgram_evolution
+LIB_KGRAM = $(BUILD_DIR)/libkgram_evolution.so
+
+all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID) $(EXE_BATCHED) $(LIB_BATCHED) $(EXE_KGRAM) $(LIB_KGRAM)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -62,6 +66,12 @@ $(EXE_BATCHED): $(SRC_BATCHED) | $(BUILD_DIR)
 $(LIB_BATCHED): $(SRC_BATCHED) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
 
+$(EXE_KGRAM): $(SRC_KGRAM) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $<
+
+$(LIB_KGRAM): $(SRC_KGRAM) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
+
 $(EXE_PROFILE): $(SRC_PROFILE) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -lineinfo -o $@ $<
 
@@ -86,6 +96,9 @@ test-monoid: $(EXE_MONOID)
 test-batched: $(EXE_BATCHED)
 	./$(EXE_BATCHED)
 
+test-kgram: $(EXE_KGRAM)
+	./$(EXE_KGRAM)
+
 test-all: test-gpu test-py
 
 bench-cpu:
@@ -99,4 +112,4 @@ eval: $(LIB)
 
 bench-all: bench-cpu bench-gpu
 
-.PHONY: all clean test-py test-gpu test-v4 test-monoid test-batched test-all bench-cpu bench-gpu eval bench-all profile
+.PHONY: all clean test-py test-gpu test-v4 test-monoid test-batched test-kgram test-all bench-cpu bench-gpu eval bench-all profile
