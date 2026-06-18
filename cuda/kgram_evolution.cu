@@ -32,6 +32,22 @@ constexpr int WARPS_PER_BLOCK = 4;
 constexpr int BLOCK_SIZE = WARPS_PER_BLOCK * WARP_SIZE;
 constexpr int STRINGS_PER_BLOCK = WARPS_PER_BLOCK;
 
+constexpr int STRINGS_PER_WARP_V2 = 2;
+constexpr int STRINGS_PER_BLOCK_V2 = WARPS_PER_BLOCK * STRINGS_PER_WARP_V2;
+
+// cp.async helpers (SM 8.0+) — async global→shared memory copy
+__device__ __forceinline__ void cp_async_8(void *dst_shared, const void *src_global) {
+    uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst_shared));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n"
+                 :: "r"(dst_addr), "l"(src_global));
+}
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n");
+}
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n");
+}
+
 #define CHECK_CUDA(call) do {                                       \
     cudaError_t err = (call);                                       \
     if (err != cudaSuccess) {                                       \
@@ -161,6 +177,195 @@ __global__ void kgram_evolution_kernel(
 }
 
 
+// ---- Pipelined V2 Kernel (dual-string per warp + async prefetch) ---------
+//
+// Each warp processes TWO strings. While string B is processed synchronously,
+// string A's k-gram table entry is prefetched asynchronously into shared memory
+// via cp.async. This hides one global memory load per iteration behind compute.
+//
+// Shared memory per block:
+//   S_sh[8][TILE_ELEMS]      2048 bytes (int8, state per string)
+//   acc_sh[8][TILE_ELEMS]    8192 bytes (int32, accumulators)
+//   T_stage[4][TILE_ELEMS]   1024 bytes (int8, prefetch staging per warp)
+//   Total:                  11264 bytes
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 16) kgram_evolution_v2_kernel(
+    const int8_t  *__restrict__ T_kgram,
+    const int8_t  *__restrict__ T_base,
+    const uint8_t *__restrict__ input,
+    const int8_t  *__restrict__ accept_mask,
+    const int8_t  *__restrict__ start_vec,
+    int *__restrict__ results,
+    int B, int B_padded, int L,
+    int sigma, int k
+) {
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int sid_A = blockIdx.x * STRINGS_PER_BLOCK_V2 + warp_id * 2;
+    int sid_B = sid_A + 1;
+    bool valid_A = (sid_A < B);
+    bool valid_B = (sid_B < B);
+
+    extern __shared__ char smem_raw[];
+
+    constexpr int N_SLOTS = WARPS_PER_BLOCK * 2;
+    int8_t  *S_all    = (int8_t *)smem_raw;
+    int32_t *acc_all  = (int32_t *)(S_all + N_SLOTS * TILE_ELEMS);
+    int8_t  *T_st_all = (int8_t *)(acc_all + N_SLOTS * TILE_ELEMS);
+
+    int slot_A = warp_id * 2;
+    int slot_B = warp_id * 2 + 1;
+
+    int8_t  *S_sh_A   = S_all + slot_A * TILE_ELEMS;
+    int8_t  *S_sh_B   = S_all + slot_B * TILE_ELEMS;
+    int32_t *acc_sh_A = acc_all + slot_A * TILE_ELEMS;
+    int32_t *acc_sh_B = acc_all + slot_B * TILE_ELEMS;
+    int8_t  *T_stage  = T_st_all + warp_id * TILE_ELEMS;
+
+    for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+        int row = e % TILE;
+        int col = e / TILE;
+        int8_t val = (col == 0) ? start_vec[row] : (int8_t)0;
+        S_sh_A[e] = val;
+        S_sh_B[e] = val;
+    }
+    __syncwarp();
+
+    if (!valid_A && !valid_B) return;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> frag_T;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> frag_S_A, frag_S_B;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> frag_acc;
+
+    wmma::load_matrix_sync(frag_S_A, S_sh_A, TILE);
+    wmma::load_matrix_sync(frag_S_B, S_sh_B, TILE);
+
+    bool active_A = valid_A, active_B = valid_B;
+
+    // ---- Macros for repeated MMA + threshold blocks ----
+    #define DO_MMA_THRESHOLD(fragS, S_sh_ptr, acc_sh_ptr)       \
+        wmma::fill_fragment(frag_acc, 0);                       \
+        wmma::mma_sync(frag_acc, frag_T, fragS, frag_acc);     \
+        wmma::store_matrix_sync(acc_sh_ptr, frag_acc, TILE,     \
+                                wmma::mem_row_major);           \
+        __syncwarp();                                           \
+        if (lane < TILE) {                                      \
+            S_sh_ptr[lane] = (int8_t)(acc_sh_ptr[lane*TILE] > 0 ? 1 : 0); \
+        }                                                       \
+        __syncwarp();                                           \
+        wmma::load_matrix_sync(fragS, S_sh_ptr, TILE);
+
+    // Main k-gram loop
+    int pos = 0;
+    for (; pos + k <= L; pos += k) {
+        if (!active_A && !active_B) break;
+
+        uint32_t idx_A = 0, idx_B = 0;
+        bool kv_A = active_A, kv_B = active_B;
+
+        if (kv_A) {
+            for (int i = 0; i < k; i++) {
+                uint8_t ch = input[(pos + i) * B_padded + sid_A];
+                if (ch >= (uint8_t)sigma) { kv_A = false; break; }
+                idx_A = idx_A * (uint32_t)sigma + (uint32_t)ch;
+            }
+        }
+        if (kv_B) {
+            for (int i = 0; i < k; i++) {
+                uint8_t ch = input[(pos + i) * B_padded + sid_B];
+                if (ch >= (uint8_t)sigma) { kv_B = false; break; }
+                idx_B = idx_B * (uint32_t)sigma + (uint32_t)ch;
+            }
+        }
+
+        if (kv_A && kv_B) {
+            // PIPELINED: async prefetch T_A → T_stage, sync process B
+            cp_async_8(T_stage + lane * 8,
+                       &T_kgram[idx_A * TILE_ELEMS + lane * 8]);
+            cp_async_commit();
+
+            wmma::load_matrix_sync(frag_T, &T_kgram[idx_B * TILE_ELEMS], TILE);
+            DO_MMA_THRESHOLD(frag_S_B, S_sh_B, acc_sh_B)
+
+            cp_async_wait_all();
+            __syncwarp();
+
+            wmma::load_matrix_sync(frag_T, T_stage, TILE);
+            DO_MMA_THRESHOLD(frag_S_A, S_sh_A, acc_sh_A)
+
+        } else if (kv_A) {
+            wmma::load_matrix_sync(frag_T, &T_kgram[idx_A * TILE_ELEMS], TILE);
+            DO_MMA_THRESHOLD(frag_S_A, S_sh_A, acc_sh_A)
+        } else if (kv_B) {
+            wmma::load_matrix_sync(frag_T, &T_kgram[idx_B * TILE_ELEMS], TILE);
+            DO_MMA_THRESHOLD(frag_S_B, S_sh_B, acc_sh_B)
+        }
+
+        // Per-char fallback for strings that just hit padding
+        if (!kv_A && active_A) {
+            for (int i = 0; i < k && (pos + i) < L; i++) {
+                uint8_t ch = input[(pos + i) * B_padded + sid_A];
+                if (ch >= (uint8_t)sigma) break;
+                wmma::load_matrix_sync(frag_T, &T_base[ch * TILE_ELEMS], TILE);
+                DO_MMA_THRESHOLD(frag_S_A, S_sh_A, acc_sh_A)
+            }
+            active_A = false;
+        }
+        if (!kv_B && active_B) {
+            for (int i = 0; i < k && (pos + i) < L; i++) {
+                uint8_t ch = input[(pos + i) * B_padded + sid_B];
+                if (ch >= (uint8_t)sigma) break;
+                wmma::load_matrix_sync(frag_T, &T_base[ch * TILE_ELEMS], TILE);
+                DO_MMA_THRESHOLD(frag_S_B, S_sh_B, acc_sh_B)
+            }
+            active_B = false;
+        }
+    }
+
+    // Tail: remaining L%k characters
+    for (; pos < L; pos++) {
+        if (active_A) {
+            uint8_t ch = input[pos * B_padded + sid_A];
+            if (ch < (uint8_t)sigma) {
+                wmma::load_matrix_sync(frag_T, &T_base[ch * TILE_ELEMS], TILE);
+                DO_MMA_THRESHOLD(frag_S_A, S_sh_A, acc_sh_A)
+            } else {
+                active_A = false;
+            }
+        }
+        if (active_B) {
+            uint8_t ch = input[pos * B_padded + sid_B];
+            if (ch < (uint8_t)sigma) {
+                wmma::load_matrix_sync(frag_T, &T_base[ch * TILE_ELEMS], TILE);
+                DO_MMA_THRESHOLD(frag_S_B, S_sh_B, acc_sh_B)
+            } else {
+                active_B = false;
+            }
+        }
+    }
+
+    #undef DO_MMA_THRESHOLD
+
+    // Accept check for both strings
+    if (lane == 0) {
+        if (valid_A) {
+            int accepted = 0;
+            for (int r = 0; r < TILE; r++) {
+                if (S_sh_A[r] > 0 && accept_mask[r] != 0) { accepted = 1; break; }
+            }
+            results[sid_A] = accepted;
+        }
+        if (valid_B) {
+            int accepted = 0;
+            for (int r = 0; r < TILE; r++) {
+                if (S_sh_B[r] > 0 && accept_mask[r] != 0) { accepted = 1; break; }
+            }
+            results[sid_B] = accepted;
+        }
+    }
+}
+
+
 // ---- Engine Struct --------------------------------------------------------
 
 struct KGramEngine {
@@ -195,7 +400,7 @@ struct KGramEngine {
         n_entries = _n_entries;
         max_B = maxB;
         max_L = maxL;
-        B_padded_max = ((maxB + STRINGS_PER_BLOCK - 1) / STRINGS_PER_BLOCK) * STRINGS_PER_BLOCK;
+        B_padded_max = ((maxB + STRINGS_PER_BLOCK_V2 - 1) / STRINGS_PER_BLOCK_V2) * STRINGS_PER_BLOCK_V2;
 
         size_t table_bytes = (size_t)n_entries * TILE_ELEMS;
         CHECK_CUDA(cudaMalloc(&d_T_kgram, table_bytes));
@@ -270,6 +475,42 @@ struct KGramEngine {
 
         return 0;
     }
+
+    int dispatch_v2(const uint8_t *h_input, int B, int L, int B_padded,
+                    int *h_results, float *kernel_ms, float *total_ms) {
+        if (!initialized) return -1;
+
+        CHECK_CUDA(cudaEventRecord(ev_start));
+
+        size_t input_bytes = (size_t)L * B_padded;
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
+
+        CHECK_CUDA(cudaEventRecord(ev_kern_start));
+
+        int n_blocks = (B + STRINGS_PER_BLOCK_V2 - 1) / STRINGS_PER_BLOCK_V2;
+        constexpr int N_SLOTS = WARPS_PER_BLOCK * 2;
+        int smem = N_SLOTS * TILE_ELEMS
+                 + N_SLOTS * TILE_ELEMS * (int)sizeof(int32_t)
+                 + WARPS_PER_BLOCK * TILE_ELEMS;
+
+        kgram_evolution_v2_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+            d_T_kgram, d_T_base, d_input, d_accept, d_start_vec,
+            d_results, B, B_padded, L, sigma, k);
+        CHECK_CUDA(cudaGetLastError());
+
+        CHECK_CUDA(cudaEventRecord(ev_kern_stop));
+
+        CHECK_CUDA(cudaMemcpy(h_results, d_results, (size_t)B * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+
+        CHECK_CUDA(cudaEventRecord(ev_stop));
+        CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
+        if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
+
+        return 0;
+    }
 };
 
 
@@ -318,6 +559,16 @@ int kgram_engine_dispatch(
 ) {
     int B_padded = ((B + STRINGS_PER_BLOCK - 1) / STRINGS_PER_BLOCK) * STRINGS_PER_BLOCK;
     return g_kgram_engine.dispatch(input, B, L, B_padded, results, kernel_ms, total_ms);
+}
+
+int kgram_engine_dispatch_v2(
+    const uint8_t *input,
+    int B, int L,
+    int *results,
+    float *kernel_ms, float *total_ms
+) {
+    int B_padded = ((B + STRINGS_PER_BLOCK_V2 - 1) / STRINGS_PER_BLOCK_V2) * STRINGS_PER_BLOCK_V2;
+    return g_kgram_engine.dispatch_v2(input, B, L, B_padded, results, kernel_ms, total_ms);
 }
 
 void kgram_prepare_input(
@@ -519,6 +770,70 @@ int main() {
         check(buf, (results_k1[i] != 0) == tests[i].expected);
     }
     printf("k=1 kernel: %.3f ms, total: %.3f ms\n", kern_ms, total_ms);
+
+    kgram_engine_destroy();
+
+    // ---- V2 (pipelined) tests ----
+    printf("\n--- V2 pipelined kernel tests ---\n");
+
+    int B_padded_v2 = ((B + STRINGS_PER_BLOCK_V2 - 1) / STRINGS_PER_BLOCK_V2) * STRINGS_PER_BLOCK_V2;
+    std::vector<uint8_t> input_v2(L_max * B_padded_v2, (uint8_t)sigma);
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < (int)tests[b].chars.size(); t++) {
+            input_v2[t * B_padded_v2 + b] = tests[b].chars[t];
+        }
+    }
+
+    // V2 with k=4
+    kgram_engine_init(T_kgram.data(), T_base, accept, start_vec,
+                      TILE, sigma, k, n_entries, B_padded_v2, L_max);
+
+    std::vector<int> results_v2(B, -1);
+    kgram_engine_dispatch_v2(input_v2.data(), B, L_max, results_v2.data(), &kern_ms, &total_ms);
+
+    for (int i = 0; i < B; i++) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "v2_k%d_%s", k, tests[i].name);
+        check(buf, (results_v2[i] != 0) == tests[i].expected);
+    }
+    printf("v2 k=%d kernel: %.3f ms, total: %.3f ms\n", k, kern_ms, total_ms);
+
+    // V2 with k=1
+    kgram_engine_init(T_kgram_k1.data(), T_base, accept, start_vec,
+                      TILE, sigma, 1, sigma, B_padded_v2, L_max);
+
+    std::vector<int> results_v2_k1(B, -1);
+    kgram_engine_dispatch_v2(input_v2.data(), B, L_max, results_v2_k1.data(), &kern_ms, &total_ms);
+
+    for (int i = 0; i < B; i++) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "v2_k1_%s", tests[i].name);
+        check(buf, (results_v2_k1[i] != 0) == tests[i].expected);
+    }
+    printf("v2 k=1 kernel: %.3f ms, total: %.3f ms\n", kern_ms, total_ms);
+
+    // V2 with odd batch size (tests boundary handling)
+    int B_odd = 7;
+    int B_padded_v2_odd = ((B_odd + STRINGS_PER_BLOCK_V2 - 1) / STRINGS_PER_BLOCK_V2) * STRINGS_PER_BLOCK_V2;
+    std::vector<uint8_t> input_v2_odd(L_max * B_padded_v2_odd, (uint8_t)sigma);
+    for (int b = 0; b < B_odd; b++) {
+        for (int t = 0; t < (int)tests[b].chars.size(); t++) {
+            input_v2_odd[t * B_padded_v2_odd + b] = tests[b].chars[t];
+        }
+    }
+
+    kgram_engine_init(T_kgram.data(), T_base, accept, start_vec,
+                      TILE, sigma, k, n_entries, B_padded_v2_odd, L_max);
+
+    std::vector<int> results_v2_odd(B_odd, -1);
+    kgram_engine_dispatch_v2(input_v2_odd.data(), B_odd, L_max, results_v2_odd.data(), &kern_ms, &total_ms);
+
+    for (int i = 0; i < B_odd; i++) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "v2_odd_%s", tests[i].name);
+        check(buf, (results_v2_odd[i] != 0) == tests[i].expected);
+    }
+    printf("v2 odd B=%d kernel: %.3f ms, total: %.3f ms\n", B_odd, kern_ms, total_ms);
 
     kgram_engine_destroy();
 

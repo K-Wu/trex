@@ -32,10 +32,16 @@ class PackedEngine:
     Set use_gpu=True to dispatch through the CUDA multi-tile kernel.
     """
 
-    def __init__(self, regexes: list[str], use_gpu: bool = False):
-        """Compile multiple regex patterns into a packed block-diagonal DFA."""
+    def __init__(self, regexes: list[str], use_gpu: bool = False,
+                 gpu_mode: str = 'auto'):
+        """Compile multiple regex patterns into a packed block-diagonal DFA.
+
+        gpu_mode: 'auto' (sparse if all patterns fit in one 16-state tile, else dense),
+                  'sparse' (force sparse kernel), 'dense' (force dense multitile kernel)
+        """
         self._regexes = regexes
         self._n_patterns = len(regexes)
+        self._gpu_mode = gpu_mode
 
         # Compile each pattern individually
         self._dfas: list[DFA] = []
@@ -54,6 +60,7 @@ class PackedEngine:
 
         # GPU engine (lazy-init)
         self._gpu_engine = None
+        self._sparse_gpu = False
         if use_gpu:
             self._init_gpu()
 
@@ -117,6 +124,13 @@ class PackedEngine:
                 mask[off + s] = 1
             self._accept_masks.append(mask)
 
+    def _can_use_sparse(self) -> bool:
+        """Check if all patterns have exactly 16 padded states (one WMMA tile)."""
+        sigma = len(self._unified_alphabet)
+        if sigma != 2:
+            return False
+        return all(n == 16 for n in self._state_counts)
+
     def _init_gpu(self, max_B: int = 65536, max_L: int = 4096):
         from src.gpu_bridge_batched import BatchedGPUSimulator, BatchedEvolutionEngine
         import ctypes
@@ -124,10 +138,25 @@ class PackedEngine:
 
         NP = self._NP
         sigma = len(self._unified_alphabet)
+        P = self._n_patterns
+
+        # Decide sparse vs dense
+        use_sparse = False
+        if self._gpu_mode == 'sparse':
+            use_sparse = True
+        elif self._gpu_mode == 'dense':
+            use_sparse = False
+        else:  # auto
+            use_sparse = self._can_use_sparse()
+
+        self._gpu_lib = sim.lib
+
+        if use_sparse:
+            self._init_gpu_sparse(sim.lib, max_B, max_L)
+            return
 
         trans = np.ascontiguousarray(self._matrix_stack, dtype=np.int8)
         sv = np.ascontiguousarray(self._start_vec, dtype=np.int8)
-        # Combined accept mask (union of all patterns) — used by single-pattern fast path
         combined_accept = np.zeros(NP, dtype=np.int8)
         for mask in self._accept_masks:
             combined_accept |= mask
@@ -141,7 +170,6 @@ class PackedEngine:
             N=NP, sigma=sigma,
             char_to_idx=self._unified_char_to_idx,
         )
-        self._gpu_lib = sim.lib
 
         # Set up dispatch_multi ctypes signature
         if not hasattr(sim.lib, '_packed_multi_setup'):
@@ -163,6 +191,87 @@ class PackedEngine:
             np.stack(self._accept_masks), dtype=np.int8
         )
 
+    def _init_gpu_sparse(self, lib, max_B: int, max_L: int):
+        import ctypes
+        P = self._n_patterns
+        sigma = len(self._unified_alphabet)
+
+        # Extract diagonal T-blocks: [P, sigma, 16, 16]
+        T_diag = np.zeros((P, sigma, 16, 16), dtype=np.int8)
+        for p in range(P):
+            off = self._offsets[p]
+            for c in range(sigma):
+                T_diag[p, c] = self._matrix_stack[c, off:off+16, off:off+16]
+
+        # Per-pattern start vectors: [P, 16]
+        start_vecs = np.zeros((P, 16), dtype=np.int8)
+        for p in range(P):
+            off = self._offsets[p]
+            start_vecs[p] = self._start_vec[off:off+16]
+
+        # Per-pattern accept masks: [P, 16]
+        accept_masks_sp = np.zeros((P, 16), dtype=np.int8)
+        for p in range(P):
+            off = self._offsets[p]
+            accept_masks_sp[p] = self._accept_masks[p][off:off+16]
+
+        T_diag = np.ascontiguousarray(T_diag, dtype=np.int8)
+        start_vecs = np.ascontiguousarray(start_vecs, dtype=np.int8)
+        accept_masks_sp = np.ascontiguousarray(accept_masks_sp, dtype=np.int8)
+
+        # Set up ctypes signatures
+        if not hasattr(lib, '_sparse_setup'):
+            lib.batched_engine_init_sparse.restype = ctypes.c_int
+            lib.batched_engine_init_sparse.argtypes = [
+                ctypes.c_int,                     # P
+                ctypes.c_int,                     # sigma
+                ctypes.POINTER(ctypes.c_int8),    # T_diag
+                ctypes.POINTER(ctypes.c_int8),    # start_vecs
+                ctypes.POINTER(ctypes.c_int8),    # accept_masks
+                ctypes.c_int,                     # max_B
+                ctypes.c_int,                     # max_L
+            ]
+            lib.batched_engine_dispatch_sparse.restype = ctypes.c_int
+            lib.batched_engine_dispatch_sparse.argtypes = [
+                ctypes.POINTER(ctypes.c_uint8),   # input
+                ctypes.c_int,                     # B
+                ctypes.c_int,                     # L
+                ctypes.POINTER(ctypes.c_int),     # results
+                ctypes.POINTER(ctypes.c_float),   # kernel_ms
+                ctypes.POINTER(ctypes.c_float),   # total_ms
+            ]
+            lib.batched_prepare_input.restype = None
+            lib.batched_prepare_input.argtypes = [
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_int,
+            ]
+            lib._sparse_setup = True
+
+        rc = lib.batched_engine_init_sparse(
+            P, sigma,
+            T_diag.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            start_vecs.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            accept_masks_sp.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            max_B, max_L,
+        )
+        if rc != 0:
+            raise RuntimeError(f"batched_engine_init_sparse failed: {rc}")
+
+        # Build char_to_idx for prepare_input
+        self._sp_identity_idx = sigma
+        self._sp_char_to_idx = np.full(256, -1, dtype=np.int32)
+        for ch, idx in self._unified_char_to_idx.items():
+            self._sp_char_to_idx[ord(ch)] = idx
+
+        self._sparse_gpu = True
+        self._gpu_engine = True  # sentinel so match_batch uses GPU path
+
     def match_batch(self, strings: list[str]) -> list[list[bool]]:
         """
         Match all strings against all patterns.
@@ -172,6 +281,29 @@ class PackedEngine:
         if self._gpu_engine is not None:
             return self._match_batch_gpu(strings)
         return self._match_batch_cpu(strings)
+
+    def _prepare_batch_sparse(self, strings: list[str]):
+        """Prepare input for sparse dispatch (reuses batched_prepare_input C func)."""
+        import ctypes
+        B = len(strings)
+        L_max = max(len(s) for s in strings) if strings else 0
+        B_padded = ((B + 63) // 64) * 64
+
+        strings_concat = "".join(strings).encode("latin-1")
+        offsets = np.zeros(B + 1, dtype=np.int32)
+        for i, s in enumerate(strings):
+            offsets[i + 1] = offsets[i] + len(s)
+
+        output = np.zeros(L_max * B_padded, dtype=np.uint8)
+        self._gpu_lib.batched_prepare_input(
+            strings_concat,
+            offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            B, B_padded, L_max,
+            self._sp_char_to_idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            self._sp_identity_idx,
+        )
+        return output, B_padded, L_max
 
     def _match_batch_gpu(self, strings: list[str]) -> list[list[bool]]:
         import ctypes
@@ -191,6 +323,9 @@ class PackedEngine:
                 results.append([is_accept] * B)
             return results
 
+        if self._sparse_gpu:
+            return self._match_batch_gpu_sparse(strings, B, L_max)
+
         input_data, B_padded, L_max = self._gpu_engine._prepare_batch(strings)
 
         flat_results = np.zeros(P * B, dtype=np.int32)
@@ -208,6 +343,31 @@ class PackedEngine:
         )
         if rc != 0:
             raise RuntimeError(f"batched_engine_dispatch_multi failed with code {rc}")
+
+        results = []
+        for p in range(P):
+            pattern_results = [bool(flat_results[p * B + j]) for j in range(B)]
+            results.append(pattern_results)
+        return results
+
+    def _match_batch_gpu_sparse(self, strings, B, L_max):
+        import ctypes
+        P = self._n_patterns
+        input_data, B_padded, L_max = self._prepare_batch_sparse(strings)
+
+        flat_results = np.zeros(P * B, dtype=np.int32)
+        kern_ms = ctypes.c_float(0)
+        total_ms = ctypes.c_float(0)
+
+        rc = self._gpu_lib.batched_engine_dispatch_sparse(
+            input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            B, L_max,
+            flat_results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ctypes.byref(kern_ms),
+            ctypes.byref(total_ms),
+        )
+        if rc != 0:
+            raise RuntimeError(f"batched_engine_dispatch_sparse failed: {rc}")
 
         results = []
         for p in range(P):
@@ -317,23 +477,34 @@ class PackedEngine:
                 'n_strings': B, 'n_patterns': P, 'NP': self._NP,
             }
 
-        input_data, B_padded, L_max = self._gpu_engine._prepare_batch(strings)
-
         flat_results = np.zeros(P * B, dtype=np.int32)
         kern_ms = ctypes.c_float(0)
         total_ms = ctypes.c_float(0)
 
-        rc = self._gpu_lib.batched_engine_dispatch_multi(
-            input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-            B, L_max,
-            self._gpu_accept_masks.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
-            P,
-            flat_results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            ctypes.byref(kern_ms),
-            ctypes.byref(total_ms),
-        )
-        if rc != 0:
-            raise RuntimeError(f"batched_engine_dispatch_multi failed with code {rc}")
+        if self._sparse_gpu:
+            input_data, B_padded, L_max = self._prepare_batch_sparse(strings)
+            rc = self._gpu_lib.batched_engine_dispatch_sparse(
+                input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                B, L_max,
+                flat_results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                ctypes.byref(kern_ms),
+                ctypes.byref(total_ms),
+            )
+            if rc != 0:
+                raise RuntimeError(f"dispatch_sparse failed: {rc}")
+        else:
+            input_data, B_padded, L_max = self._gpu_engine._prepare_batch(strings)
+            rc = self._gpu_lib.batched_engine_dispatch_multi(
+                input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                B, L_max,
+                self._gpu_accept_masks.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+                P,
+                flat_results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                ctypes.byref(kern_ms),
+                ctypes.byref(total_ms),
+            )
+            if rc != 0:
+                raise RuntimeError(f"dispatch_multi failed: {rc}")
 
         results = []
         for p in range(P):
@@ -359,5 +530,6 @@ class PackedEngine:
             'NP': self._NP,
             'unified_alphabet_size': len(self._unified_alphabet),
             'regexes': list(self._regexes),
-            'backend': 'gpu' if self._gpu_engine is not None else 'cpu',
+            'backend': ('gpu-sparse' if self._sparse_gpu else 'gpu')
+                       if self._gpu_engine is not None else 'cpu',
         }

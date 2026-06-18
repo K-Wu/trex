@@ -31,18 +31,22 @@ def _find_lib():
 
 
 STRINGS_PER_BLOCK = 4
+STRINGS_PER_BLOCK_V2 = 8
 
 
 class KGramGPUEngine:
     """Wraps a persistent GPU engine context for k-gram TC evolution."""
 
     def __init__(self, lib, dm: DFAMatrices, k: int,
-                 max_B: int = 65536, max_L: int = 4096):
+                 max_B: int = 65536, max_L: int = 4096,
+                 pipelined: bool = False):
         self.lib = lib
         self.dm = dm
         self.k = k
         self.N = dm.n_states
         self.sigma = len(dm.alphabet)
+        self.pipelined = pipelined
+        self._spb = STRINGS_PER_BLOCK_V2 if pipelined else STRINGS_PER_BLOCK
 
         kg = precompute_kgrams(dm, k, monoid=None)
         n_entries = self.sigma ** k
@@ -81,7 +85,7 @@ class KGramGPUEngine:
         B = len(strings)
         L_max = max(len(s) for s in strings) if strings else 0
 
-        B_padded = ((B + STRINGS_PER_BLOCK - 1) // STRINGS_PER_BLOCK) * STRINGS_PER_BLOCK
+        B_padded = ((B + self._spb - 1) // self._spb) * self._spb
 
         strings_concat = "".join(strings).encode("latin-1")
         offsets = np.zeros(B + 1, dtype=np.int32)
@@ -117,7 +121,10 @@ class KGramGPUEngine:
         kern_ms = ctypes.c_float(0)
         total_ms = ctypes.c_float(0)
 
-        rc = self.lib.kgram_engine_dispatch(
+        dispatch_fn = (self.lib.kgram_engine_dispatch_v2
+                       if self.pipelined
+                       else self.lib.kgram_engine_dispatch)
+        rc = dispatch_fn(
             input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             B, L_max,
             results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
@@ -145,7 +152,10 @@ class KGramGPUEngine:
         kern_ms = ctypes.c_float(0)
         total_ms = ctypes.c_float(0)
 
-        rc = self.lib.kgram_engine_dispatch(
+        dispatch_fn = (self.lib.kgram_engine_dispatch_v2
+                       if self.pipelined
+                       else self.lib.kgram_engine_dispatch)
+        rc = dispatch_fn(
             input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             B, L_max,
             results.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
@@ -190,6 +200,15 @@ class KGramGPUSimulator:
             ctypes.POINTER(ctypes.c_float),
         ]
 
+        self.lib.kgram_engine_dispatch_v2.restype = ctypes.c_int
+        self.lib.kgram_engine_dispatch_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+
         self.lib.kgram_prepare_input.restype = None
         self.lib.kgram_prepare_input.argtypes = [
             ctypes.c_char_p,
@@ -208,5 +227,6 @@ class KGramGPUSimulator:
 
     def create_engine(self, dm: DFAMatrices, k: int,
                       max_B: int = 65536,
-                      max_L: int = 4096) -> KGramGPUEngine:
-        return KGramGPUEngine(self.lib, dm, k, max_B, max_L)
+                      max_L: int = 4096,
+                      pipelined: bool = False) -> KGramGPUEngine:
+        return KGramGPUEngine(self.lib, dm, k, max_B, max_L, pipelined=pipelined)
