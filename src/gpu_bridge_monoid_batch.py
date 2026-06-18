@@ -64,6 +64,25 @@ class MonoidBatchEngine:
         if rc != 0:
             raise RuntimeError(f"monoid_batch_engine_init failed with code {rc}")
 
+        fused = np.ascontiguousarray(tables['fused_compose'])
+        kgram_k = tables['kgram_k']
+        sigma_k = tables['sigma_k']
+        sigma = tables['sigma']
+        kgram = tables['kgram_compose']
+
+        kgram_ptr = (kgram.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+                     if kgram is not None else None)
+
+        rc = self.lib.monoid_batch_engine_set_kgram(
+            fused.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            kgram_ptr,
+            kgram_k,
+            sigma_k,
+            sigma,
+        )
+        if rc != 0:
+            raise RuntimeError(f"monoid_batch_engine_set_kgram failed with code {rc}")
+
     def destroy(self):
         self.lib.monoid_batch_engine_destroy()
 
@@ -169,6 +188,15 @@ class MonoidBatchGPUSimulator:
             ctypes.POINTER(ctypes.c_uint8),   # monoid_compose
             ctypes.c_int,                     # max_total_chars
             ctypes.c_int,                     # max_batch
+        ]
+
+        self.lib.monoid_batch_engine_set_kgram.restype = ctypes.c_int
+        self.lib.monoid_batch_engine_set_kgram.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),   # fused_compose
+            ctypes.POINTER(ctypes.c_uint8),   # kgram_compose (can be NULL)
+            ctypes.c_int,                     # kgram_k
+            ctypes.c_int,                     # sigma_k
+            ctypes.c_int,                     # sigma
         ]
 
         self.lib.monoid_batch_engine_destroy.restype = None

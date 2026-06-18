@@ -134,6 +134,17 @@ class OptimizedEngine:
         md = compute_monoid(self._dm, max_size=self._monoid_cap)
         if md is not None:
             self._md = md
+            if md.size <= 255:
+                try:
+                    self._setup_monoid_batch_gpu()
+                    self._representation = "dfa"
+                    self._selection_reason = (
+                        f"DFA has {n_states} states; monoid size {md.size} ≤ 255; "
+                        f"auto-selected monoid_batch+gpu"
+                    )
+                    return
+                except Exception:
+                    pass
             k = auto_k(alphabet_size)
             self._kg = precompute_kgrams(self._dm, k, monoid=self._md)
             self._kgram_k = k

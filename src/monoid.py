@@ -197,15 +197,15 @@ def precompute_batch_tables(md: MonoidData, dm: DFAMatrices) -> dict:
 
     Returns a dict with keys:
         char_compose   (M * sigma_ext,) uint8 — fused compose table
-                       char_compose[curr * sigma_ext + ch_idx] = next monoid element
         raw_char_map   (256,) uint8 — maps raw ASCII byte to DFA char index
-                       unmapped bytes map to sigma (identity column)
         accept         (M,) uint8 — 1 if monoid element is accepting
         monoid_compose (M * M,) uint8 — M×M compose table for tree reduce
-        M              int — monoid size (must be ≤ 255 for uint8)
-        sigma_ext      int — len(alphabet) + 1 (extra identity column)
-        identity_idx   int — index of identity monoid element
+        fused_compose  (M * 256,) uint8 — merged charmap+compose in one lookup
+        kgram_compose  (M * sigma_k,) uint8 or None — k-gram compose table
+        M, sigma, sigma_ext, sigma_k, kgram_k, identity_idx
     """
+    import math
+
     M = md.size
     if M > 255:
         raise ValueError(f"Monoid size {M} exceeds uint8 limit (255)")
@@ -231,12 +231,57 @@ def precompute_batch_tables(md: MonoidData, dm: DFAMatrices) -> dict:
         md.compose_table.astype(np.uint8).reshape(-1)
     )
 
+    fused_compose = np.zeros(M * 256, dtype=np.uint8)
+    for m in range(M):
+        for byte_val in range(256):
+            ch_dfa_idx = raw_char_map[byte_val]
+            fused_compose[m * 256 + byte_val] = char_compose[m, ch_dfa_idx]
+
+    if sigma >= 2:
+        kgram_k = int(math.log(256) / math.log(sigma))
+        kgram_k = max(kgram_k, 1)
+        sigma_k = sigma ** kgram_k
+        while sigma_k > 256:
+            kgram_k -= 1
+            sigma_k = sigma ** kgram_k
+    else:
+        kgram_k = 1
+        sigma_k = 1
+
+    if kgram_k >= 2:
+        char_monoid_by_dfa = [md.identity_idx] * sigma
+        for ch_name, ch_dfa_idx in dm.char_to_idx.items():
+            char_monoid_by_dfa[ch_dfa_idx] = md.char_to_monoid[ch_name]
+
+        kgram_compose = np.zeros(M * sigma_k, dtype=np.uint8)
+        for m in range(M):
+            for gram in range(sigma_k):
+                chars = []
+                g = gram
+                for _ in range(kgram_k):
+                    chars.append(g % sigma)
+                    g //= sigma
+                chars.reverse()
+                curr = m
+                for dfa_idx in chars:
+                    ch_monoid = char_monoid_by_dfa[dfa_idx]
+                    curr = int(md.compose_table[ch_monoid, curr])
+                kgram_compose[m * sigma_k + gram] = curr
+    else:
+        kgram_compose = None
+
     return {
         'char_compose': np.ascontiguousarray(char_compose.reshape(-1)),
         'raw_char_map': raw_char_map,
         'accept': accept,
         'monoid_compose': monoid_compose,
+        'fused_compose': np.ascontiguousarray(fused_compose),
+        'kgram_compose': (np.ascontiguousarray(kgram_compose)
+                          if kgram_compose is not None else None),
         'M': M,
+        'sigma': sigma,
         'sigma_ext': sigma_ext,
+        'sigma_k': sigma_k,
+        'kgram_k': kgram_k,
         'identity_idx': md.identity_idx,
     }

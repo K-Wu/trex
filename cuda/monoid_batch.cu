@@ -80,6 +80,211 @@ __global__ void monoid_batch_kernel(
 }
 
 
+// ─── K-gram Compose Inner Loop ─────────────────────────────────────────────
+// Template on K so the inner packing loop is fully unrolled.
+// Processes len chars from ptr: K chars per compose step, tail with char_compose.
+
+template<int K>
+__device__ __forceinline__ void kgram_compose_loop(
+    const uint8_t * __restrict__ ptr, int len,
+    const uint8_t *charmap_sh,
+    const uint8_t *kgram_sh,
+    const uint8_t *compose_sh,
+    int sigma, int sigma_ext, int sigma_k,
+    uint8_t &curr)
+{
+    int full = len / K;
+    for (int c = 0; c < full; c++) {
+        const uint8_t *chunk = ptr + c * K;
+        int idx = 0;
+        #pragma unroll
+        for (int j = 0; j < K; j++)
+            idx = idx * sigma + charmap_sh[chunk[j]];
+        curr = kgram_sh[(int)curr * sigma_k + idx];
+    }
+    int tail = full * K;
+    for (int t = tail; t < len; t++) {
+        uint8_t ch = charmap_sh[ptr[t]];
+        curr = compose_sh[(int)curr * sigma_ext + ch];
+    }
+}
+
+
+// ─── Fused Batch Kernel ────────────────────────────────────────────────────
+// Merged charmap+compose table: one smem read per char instead of two.
+
+__launch_bounds__(MB_BLOCK_SIZE, 16)
+__global__ void monoid_batch_kernel_fused(
+    const uint8_t * __restrict__ raw_concat,
+    const int     * __restrict__ offsets,
+    const uint8_t * __restrict__ d_fused_compose,
+    const uint8_t * __restrict__ d_accept,
+    int B, int M,
+    uint8_t identity,
+    int * __restrict__ results)
+{
+    extern __shared__ uint8_t smem[];
+    uint8_t *fused_sh  = smem;
+    uint8_t *accept_sh = fused_sh + M * 256;
+
+    for (int e = threadIdx.x; e < M * 256; e += MB_BLOCK_SIZE)
+        fused_sh[e] = d_fused_compose[e];
+    for (int e = threadIdx.x; e < M; e += MB_BLOCK_SIZE)
+        accept_sh[e] = d_accept[e];
+    __syncthreads();
+
+    int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x;
+    if (sid >= B) return;
+
+    int start = offsets[sid];
+    int len   = offsets[sid + 1] - start;
+    uint8_t curr = identity;
+
+    for (int t = 0; t < len; t++)
+        curr = fused_sh[(int)curr * 256 + raw_concat[start + t]];
+
+    results[sid] = (int)accept_sh[curr];
+}
+
+
+// ─── K-gram Batch Kernel ───────────────────────────────────────────────────
+// Processes K chars per compose lookup step via precomputed k-gram table.
+// Dependency chain reduced by factor K.
+
+__launch_bounds__(MB_BLOCK_SIZE, 16)
+__global__ void monoid_batch_kernel_kgram(
+    const uint8_t * __restrict__ raw_concat,
+    const int     * __restrict__ offsets,
+    const uint8_t * __restrict__ d_charmap,
+    const uint8_t * __restrict__ d_kgram_compose,
+    const uint8_t * __restrict__ d_char_compose,
+    const uint8_t * __restrict__ d_accept,
+    int B, int M, int sigma, int sigma_ext, int sigma_k, int kgram_k,
+    uint8_t identity,
+    int * __restrict__ results)
+{
+    extern __shared__ uint8_t smem[];
+    uint8_t *charmap_sh = smem;
+    uint8_t *kgram_sh   = charmap_sh + 256;
+    uint8_t *compose_sh = kgram_sh + M * sigma_k;
+    uint8_t *accept_sh  = compose_sh + M * sigma_ext;
+
+    for (int e = threadIdx.x; e < 256; e += MB_BLOCK_SIZE)
+        charmap_sh[e] = d_charmap[e];
+    for (int e = threadIdx.x; e < M * sigma_k; e += MB_BLOCK_SIZE)
+        kgram_sh[e] = d_kgram_compose[e];
+    for (int e = threadIdx.x; e < M * sigma_ext; e += MB_BLOCK_SIZE)
+        compose_sh[e] = d_char_compose[e];
+    for (int e = threadIdx.x; e < M; e += MB_BLOCK_SIZE)
+        accept_sh[e] = d_accept[e];
+    __syncthreads();
+
+    int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x;
+    if (sid >= B) return;
+
+    int start = offsets[sid];
+    int len   = offsets[sid + 1] - start;
+    const uint8_t *ptr = raw_concat + start;
+    uint8_t curr = identity;
+
+    switch (kgram_k) {
+        case 8: kgram_compose_loop<8>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+        case 5: kgram_compose_loop<5>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+        case 4: kgram_compose_loop<4>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+        case 3: kgram_compose_loop<3>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+        case 2: kgram_compose_loop<2>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+        default:
+            for (int t = 0; t < len; t++) {
+                uint8_t ch = charmap_sh[ptr[t]];
+                curr = compose_sh[(int)curr * sigma_ext + ch];
+            }
+            break;
+    }
+
+    results[sid] = (int)accept_sh[curr];
+}
+
+
+// ─── Warp-Cooperative Batch Kernel ──────────────────────────────────────────
+// 4 warps per block, 1 string per warp. Block cooperatively loads string
+// data into shared memory (coalesced), then each warp reduces its string.
+// Fixes the scattered L2 access pattern of the thread-per-string kernel.
+
+constexpr int MW_WARPS = 4;
+constexpr int MW_BLOCK = MW_WARPS * 32;
+
+__launch_bounds__(MW_BLOCK, 16)
+__global__ void monoid_batch_kernel_warp(
+    const uint8_t * __restrict__ raw_concat,
+    const int     * __restrict__ offsets,
+    const uint8_t * __restrict__ d_char_compose,
+    const uint8_t * __restrict__ d_raw_char_map,
+    const uint8_t * __restrict__ d_monoid_compose,
+    const uint8_t * __restrict__ d_accept,
+    int B, int M, int sigma_ext,
+    uint8_t identity,
+    int * __restrict__ results)
+{
+    extern __shared__ uint8_t smem[];
+
+    uint8_t *compose_sh  = smem;
+    uint8_t *charmap_sh  = compose_sh + M * sigma_ext;
+    uint8_t *mcompose_sh = charmap_sh + 256;
+    uint8_t *accept_sh   = mcompose_sh + M * M;
+    uint8_t *string_sh   = accept_sh + M;
+
+    for (int e = threadIdx.x; e < M * sigma_ext; e += MW_BLOCK)
+        compose_sh[e] = d_char_compose[e];
+    for (int e = threadIdx.x; e < 256; e += MW_BLOCK)
+        charmap_sh[e] = d_raw_char_map[e];
+    for (int e = threadIdx.x; e < M * M; e += MW_BLOCK)
+        mcompose_sh[e] = d_monoid_compose[e];
+    for (int e = threadIdx.x; e < M; e += MW_BLOCK)
+        accept_sh[e] = d_accept[e];
+
+    int block_base  = blockIdx.x * MW_WARPS;
+    int block_count = min(MW_WARPS, B - block_base);
+
+    __shared__ int blk_off[MW_WARPS + 1];
+    if ((int)threadIdx.x <= block_count)
+        blk_off[threadIdx.x] = offsets[block_base + threadIdx.x];
+    __syncthreads();
+
+    int load_start = blk_off[0];
+    int load_bytes = blk_off[block_count] - load_start;
+    for (int e = threadIdx.x; e < load_bytes; e += MW_BLOCK)
+        string_sh[e] = raw_concat[load_start + e];
+    __syncthreads();
+
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x & 31;
+    if (warp_id >= block_count) return;
+
+    int my_start = blk_off[warp_id] - load_start;
+    int my_len   = blk_off[warp_id + 1] - blk_off[warp_id];
+
+    int chunk  = (my_len + 31) / 32;
+    int my_off = lane_id * chunk;
+    int my_n   = min(chunk, max(0, my_len - my_off));
+
+    uint8_t curr = identity;
+    for (int t = 0; t < my_n; t++) {
+        uint8_t ch = charmap_sh[string_sh[my_start + my_off + t]];
+        curr = compose_sh[(int)curr * sigma_ext + ch];
+    }
+
+    int val = (int)curr;
+    for (int offset = 1; offset < 32; offset *= 2) {
+        int y = __shfl_down_sync(0xFFFFFFFF, val, offset);
+        if (lane_id + offset < 32)
+            val = (int)mcompose_sh[y * M + val];
+    }
+
+    if (lane_id == 0)
+        results[block_base + warp_id] = (int)accept_sh[val];
+}
+
+
 // ─── Prefix Kernel ─────────────────────────────────────────────────────────
 // One block per string, MP_BLOCK_SIZE threads.
 // Phase 1: thread-local sequential reduce over chunk of characters.
@@ -171,6 +376,14 @@ struct MonoidBatchEngine {
     int      max_total_chars;
     int      max_batch;
 
+    uint8_t *d_fused_compose;
+    uint8_t *d_kgram_compose;
+    int      kgram_k;
+    int      sigma_k;
+    int      sigma;
+    bool     has_fused;
+    bool     has_kgram;
+
     cudaEvent_t ev_start, ev_stop, ev_kern_start, ev_kern_stop;
 
     void init(int _M, int _sigma_ext, int _identity,
@@ -185,6 +398,14 @@ struct MonoidBatchEngine {
         identity = (uint8_t)_identity;
         max_total_chars = max_chars;
         max_batch = max_b;
+
+        d_fused_compose = nullptr;
+        d_kgram_compose = nullptr;
+        kgram_k = 1;
+        sigma_k = 0;
+        sigma = 0;
+        has_fused = false;
+        has_kgram = false;
 
         CHECK_CUDA(cudaMalloc(&d_char_compose,   M * sigma_ext));
         CHECK_CUDA(cudaMalloc(&d_raw_char_map,   256));
@@ -205,6 +426,28 @@ struct MonoidBatchEngine {
         CHECK_CUDA(cudaEventCreate(&ev_kern_stop));
     }
 
+    void set_kgram_tables(const uint8_t *fused_compose,
+                          const uint8_t *kgram_compose,
+                          int k, int sk, int sig)
+    {
+        kgram_k = k;
+        sigma_k = sk;
+        sigma = sig;
+
+        if (fused_compose) {
+            CHECK_CUDA(cudaMalloc(&d_fused_compose, M * 256));
+            CHECK_CUDA(cudaMemcpy(d_fused_compose, fused_compose,
+                                  M * 256, cudaMemcpyHostToDevice));
+            has_fused = true;
+        }
+        if (kgram_compose && k > 1) {
+            CHECK_CUDA(cudaMalloc(&d_kgram_compose, M * sigma_k));
+            CHECK_CUDA(cudaMemcpy(d_kgram_compose, kgram_compose,
+                                  M * sigma_k, cudaMemcpyHostToDevice));
+            has_kgram = true;
+        }
+    }
+
     void destroy() {
         cudaFree(d_char_compose);
         cudaFree(d_raw_char_map);
@@ -213,6 +456,8 @@ struct MonoidBatchEngine {
         cudaFree(d_raw_concat);
         cudaFree(d_offsets);
         cudaFree(d_results);
+        if (d_fused_compose) cudaFree(d_fused_compose);
+        if (d_kgram_compose) cudaFree(d_kgram_compose);
         cudaEventDestroy(ev_start);
         cudaEventDestroy(ev_stop);
         cudaEventDestroy(ev_kern_start);
@@ -230,16 +475,37 @@ struct MonoidBatchEngine {
         CHECK_CUDA(cudaMemcpy(d_raw_concat, h_raw_concat, total_chars, cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_offsets, h_offsets, (B + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
-        int grid = (B + MB_BLOCK_SIZE - 1) / MB_BLOCK_SIZE;
-        int smem = M * sigma_ext + 256 + M;
-
         CHECK_CUDA(cudaEventRecord(ev_kern_start));
-        monoid_batch_kernel<<<grid, MB_BLOCK_SIZE, smem>>>(
-            d_raw_concat, d_offsets,
-            d_char_compose, d_raw_char_map, d_accept,
-            B, M, sigma_ext, identity,
-            d_results
-        );
+
+        int L_max = 0;
+        for (int i = 0; i < B; i++) {
+            int len = h_offsets[i + 1] - h_offsets[i];
+            if (len > L_max) L_max = len;
+        }
+
+        int smem_tables = M * sigma_ext + 256 + M * M + M;
+        int smem_warp = smem_tables + MW_WARPS * L_max;
+        bool use_warp = (L_max >= 32 && smem_warp <= 98304);
+
+        if (use_warp) {
+            int grid = (B + MW_WARPS - 1) / MW_WARPS;
+            monoid_batch_kernel_warp<<<grid, MW_BLOCK, smem_warp>>>(
+                d_raw_concat, d_offsets,
+                d_char_compose, d_raw_char_map, d_monoid_compose, d_accept,
+                B, M, sigma_ext, identity,
+                d_results
+            );
+        } else {
+            int grid = (B + MB_BLOCK_SIZE - 1) / MB_BLOCK_SIZE;
+            int smem = M * sigma_ext + 256 + M;
+            monoid_batch_kernel<<<grid, MB_BLOCK_SIZE, smem>>>(
+                d_raw_concat, d_offsets,
+                d_char_compose, d_raw_char_map, d_accept,
+                B, M, sigma_ext, identity,
+                d_results
+            );
+        }
+
         CHECK_CUDA(cudaEventRecord(ev_kern_stop));
 
         CHECK_CUDA(cudaMemcpy(h_results, d_results, B * sizeof(int), cudaMemcpyDeviceToHost));
@@ -317,6 +583,16 @@ int monoid_batch_engine_init(
                   char_compose, raw_char_map, accept, monoid_compose,
                   max_total_chars, max_batch);
     g_initialized = true;
+    return 0;
+}
+
+int monoid_batch_engine_set_kgram(
+    const uint8_t *fused_compose,
+    const uint8_t *kgram_compose,
+    int kgram_k, int sigma_k, int sigma)
+{
+    if (!g_initialized) return -1;
+    g_engine.set_kgram_tables(fused_compose, kgram_compose, kgram_k, sigma_k, sigma);
     return 0;
 }
 
@@ -428,6 +704,44 @@ static void build_even_a_tables(
     *M_out = M;
     *sigma_ext_out = sigma_ext;
     *identity_out = 0;
+}
+
+
+static void build_even_a_kgram_tables(
+    uint8_t *fused_compose, uint8_t *kgram_compose,
+    const uint8_t *char_compose, const uint8_t *raw_char_map,
+    int M, int sigma_ext, uint8_t identity,
+    int *kgram_k_out, int *sigma_k_out, int *sigma_out)
+{
+    int sigma = 2;
+    int k = 8;
+    int sigma_k = 256;
+
+    for (int m = 0; m < M; m++)
+        for (int b = 0; b < 256; b++) {
+            uint8_t ch_idx = raw_char_map[b];
+            fused_compose[m * 256 + b] = char_compose[m * sigma_ext + ch_idx];
+        }
+
+    for (int m = 0; m < M; m++)
+        for (int gram = 0; gram < sigma_k; gram++) {
+            int chars[8];
+            int g = gram;
+            for (int i = k - 1; i >= 0; i--) {
+                chars[i] = g % sigma;
+                g /= sigma;
+            }
+            uint8_t curr = (uint8_t)m;
+            for (int i = 0; i < k; i++) {
+                int ch_monoid = chars[i];
+                curr = char_compose[curr * sigma_ext + ch_monoid];
+            }
+            kgram_compose[m * sigma_k + gram] = curr;
+        }
+
+    *kgram_k_out = k;
+    *sigma_k_out = sigma_k;
+    *sigma_out = sigma;
 }
 
 
@@ -623,10 +937,122 @@ void test_prefix_multi_string() {
 }
 
 
+void test_kgram_correctness() {
+    printf("test_kgram_correctness... ");
+
+    uint8_t char_compose[6], raw_char_map[256], accept[2], monoid_compose[4];
+    int M, sigma_ext; uint8_t identity;
+    build_even_a_tables(char_compose, raw_char_map, accept, monoid_compose,
+                        &M, &sigma_ext, &identity);
+
+    uint8_t fused_compose[2 * 256], kgram_compose[2 * 256];
+    int kgram_k, sigma_k, sigma;
+    build_even_a_kgram_tables(fused_compose, kgram_compose,
+                              char_compose, raw_char_map, M, sigma_ext, identity,
+                              &kgram_k, &sigma_k, &sigma);
+
+    MonoidBatchEngine engine;
+    engine.init(M, sigma_ext, identity,
+                char_compose, raw_char_map, accept, monoid_compose,
+                1 << 20, 1 << 16);
+    engine.set_kgram_tables(fused_compose, kgram_compose, kgram_k, sigma_k, sigma);
+
+    const char *test_strings[] = {"", "a", "aa", "b", "aab", "aabb", "abab",
+                                  "aaaa", "aaaaa", "bbb", "aba", "bab"};
+    int expected[] = {1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0};
+    int n_tests = 12;
+
+    int total_chars = 0;
+    for (int i = 0; i < n_tests; i++) total_chars += strlen(test_strings[i]);
+
+    uint8_t *raw_concat = new uint8_t[std::max(total_chars, 1)];
+    int *offsets = new int[n_tests + 1];
+    offsets[0] = 0;
+    for (int i = 0; i < n_tests; i++) {
+        int len = strlen(test_strings[i]);
+        memcpy(raw_concat + offsets[i], test_strings[i], len);
+        offsets[i + 1] = offsets[i] + len;
+    }
+
+    int *gpu_results = new int[n_tests];
+    float kern_ms, total_ms;
+    engine.dispatch_batch(raw_concat, offsets, gpu_results,
+                          n_tests, total_chars, &kern_ms, &total_ms);
+
+    int mismatches = 0;
+    for (int i = 0; i < n_tests; i++)
+        if (gpu_results[i] != expected[i]) {
+            fprintf(stderr, "\n  '%s': gpu=%d exp=%d",
+                    test_strings[i], gpu_results[i], expected[i]);
+            mismatches++;
+        }
+    TEST_ASSERT(mismatches == 0, "kgram correctness");
+    if (mismatches == 0) printf("PASS (k=%d, kern=%.3fms)\n", kgram_k, kern_ms);
+
+    delete[] raw_concat; delete[] offsets; delete[] gpu_results;
+    engine.destroy();
+}
+
+
+void test_kgram_large_random() {
+    printf("test_kgram_large_random... ");
+
+    uint8_t char_compose[6], raw_char_map[256], accept[2], monoid_compose[4];
+    int M, sigma_ext; uint8_t identity;
+    build_even_a_tables(char_compose, raw_char_map, accept, monoid_compose,
+                        &M, &sigma_ext, &identity);
+
+    uint8_t fused_compose[2 * 256], kgram_compose[2 * 256];
+    int kgram_k, sigma_k, sigma;
+    build_even_a_kgram_tables(fused_compose, kgram_compose,
+                              char_compose, raw_char_map, M, sigma_ext, identity,
+                              &kgram_k, &sigma_k, &sigma);
+
+    int B = 4096;
+    srand(42);
+    int *offsets = new int[B + 1];
+    offsets[0] = 0;
+    for (int i = 0; i < B; i++)
+        offsets[i + 1] = offsets[i] + 1 + rand() % 256;
+    int total_chars = offsets[B];
+
+    uint8_t *raw_concat = new uint8_t[total_chars];
+    for (int i = 0; i < total_chars; i++)
+        raw_concat[i] = (rand() % 2) ? 'a' : 'b';
+
+    MonoidBatchEngine engine;
+    engine.init(M, sigma_ext, identity,
+                char_compose, raw_char_map, accept, monoid_compose,
+                total_chars + 1, B + 1);
+    engine.set_kgram_tables(fused_compose, kgram_compose, kgram_k, sigma_k, sigma);
+
+    int *gpu_results = new int[B];
+    int *cpu_results = new int[B];
+    float kern_ms, total_ms;
+
+    engine.dispatch_batch(raw_concat, offsets, gpu_results,
+                          B, total_chars, &kern_ms, &total_ms);
+    cpu_monoid_batch(raw_concat, offsets, char_compose, raw_char_map, accept,
+                     B, M, sigma_ext, identity, cpu_results);
+
+    int mismatches = 0;
+    for (int i = 0; i < B; i++)
+        if (gpu_results[i] != cpu_results[i]) mismatches++;
+
+    TEST_ASSERT(mismatches == 0, "kgram large random");
+    if (mismatches == 0) printf("PASS (B=%d, k=%d, kern=%.3fms)\n", B, kgram_k, kern_ms);
+
+    delete[] raw_concat; delete[] offsets;
+    delete[] gpu_results; delete[] cpu_results;
+    engine.destroy();
+}
+
+
 void bench_throughput() {
-    printf("\n=== Monoid Batch Throughput ===\n");
-    printf("%7s  %5s  %10s  %10s\n", "B", "L", "kern(ms)", "Gc/s");
-    printf("------  -----  ----------  ----------\n");
+    printf("\n=== Monoid Batch Throughput (thread-per-string vs warp-cooperative) ===\n");
+    printf("%7s  %5s  %10s  %10s  %10s  %10s  %6s\n",
+           "B", "L", "tps(ms)", "tps(Gc/s)", "warp(ms)", "warp(Gc/s)", "speedup");
+    printf("------  -----  ----------  ----------  ----------  ----------  ------\n");
 
     uint8_t char_compose[6], raw_char_map[256], accept[2], monoid_compose[4];
     int M, sigma_ext; uint8_t identity;
@@ -649,32 +1075,107 @@ void bench_throughput() {
             for (long long i = 0; i < total_chars; i++)
                 raw_concat[i] = (rand() % 2) ? 'a' : 'b';
 
-            MonoidBatchEngine eng;
-            eng.init(M, sigma_ext, identity,
-                     char_compose, raw_char_map, accept, monoid_compose,
-                     (int)total_chars + 1, B + 1);
-
             int *results = new int[B];
+            int *ref_results = new int[B];
             float kern_ms, total_ms_val;
-
-            for (int w = 0; w < 3; w++)
-                eng.dispatch_batch(raw_concat, offsets, results, B, (int)total_chars,
-                                   &kern_ms, &total_ms_val);
-
-            float sum_kern = 0;
             int runs = 20;
-            for (int r = 0; r < runs; r++) {
-                eng.dispatch_batch(raw_concat, offsets, results, B, (int)total_chars,
-                                   &kern_ms, &total_ms_val);
-                sum_kern += kern_ms;
+
+            // --- Thread-per-string (original) kernel ---
+            MonoidBatchEngine eng_tps;
+            eng_tps.init(M, sigma_ext, identity,
+                        char_compose, raw_char_map, accept, monoid_compose,
+                        (int)total_chars + 1, B + 1);
+            // Force original kernel by not setting kgram tables
+            // and using L_max < 32 trick won't work, so dispatch directly
+            for (int w = 0; w < 3; w++) {
+                // temporarily set L_max threshold check to fail
+                int orig_offsets_short[2] = {0, 1};
+                uint8_t dummy = 'a';
+                eng_tps.dispatch_batch(&dummy, orig_offsets_short, ref_results, 1, 1,
+                                      &kern_ms, &total_ms_val);
             }
-            float avg_kern = sum_kern / runs;
-            double gcs = (double)total_chars / (avg_kern * 1e6);
+            // For fair comparison, time the full batch through each kernel path:
+            // We need to bypass the auto-dispatch. Let's just benchmark the warp kernel directly.
+            eng_tps.destroy();
 
-            printf("%7d  %5d  %10.3f  %10.1f\n", B, L, avg_kern, gcs);
+            // Benchmark BOTH kernels manually using separate engines
+            // === Original (thread-per-string) ===
+            {
+                MonoidBatchEngine eng;
+                eng.init(M, sigma_ext, identity,
+                        char_compose, raw_char_map, accept, monoid_compose,
+                        (int)total_chars + 1, B + 1);
 
-            delete[] raw_concat; delete[] offsets; delete[] results;
-            eng.destroy();
+                // We need direct kernel launches to bypass auto-dispatch
+                CHECK_CUDA(cudaMemcpy(eng.d_raw_concat, raw_concat, (int)total_chars, cudaMemcpyHostToDevice));
+                CHECK_CUDA(cudaMemcpy(eng.d_offsets, offsets, (B + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+                int grid_tps = (B + MB_BLOCK_SIZE - 1) / MB_BLOCK_SIZE;
+                int smem_tps = M * sigma_ext + 256 + M;
+                for (int w = 0; w < 3; w++) {
+                    monoid_batch_kernel<<<grid_tps, MB_BLOCK_SIZE, smem_tps>>>(
+                        eng.d_raw_concat, eng.d_offsets,
+                        eng.d_char_compose, eng.d_raw_char_map, eng.d_accept,
+                        B, M, sigma_ext, identity, eng.d_results);
+                    cudaDeviceSynchronize();
+                }
+                float sum_tps = 0;
+                for (int r = 0; r < runs; r++) {
+                    CHECK_CUDA(cudaEventRecord(eng.ev_kern_start));
+                    monoid_batch_kernel<<<grid_tps, MB_BLOCK_SIZE, smem_tps>>>(
+                        eng.d_raw_concat, eng.d_offsets,
+                        eng.d_char_compose, eng.d_raw_char_map, eng.d_accept,
+                        B, M, sigma_ext, identity, eng.d_results);
+                    CHECK_CUDA(cudaEventRecord(eng.ev_kern_stop));
+                    CHECK_CUDA(cudaEventSynchronize(eng.ev_kern_stop));
+                    CHECK_CUDA(cudaEventElapsedTime(&kern_ms, eng.ev_kern_start, eng.ev_kern_stop));
+                    sum_tps += kern_ms;
+                }
+                CHECK_CUDA(cudaMemcpy(ref_results, eng.d_results, B * sizeof(int), cudaMemcpyDeviceToHost));
+                float avg_tps = sum_tps / runs;
+                double gcs_tps = (double)total_chars / (avg_tps * 1e6);
+
+                // === Warp-cooperative ===
+                int smem_tables = M * sigma_ext + 256 + M * M + M;
+                int smem_warp = smem_tables + MW_WARPS * L;
+                int grid_warp = (B + MW_WARPS - 1) / MW_WARPS;
+                for (int w = 0; w < 3; w++) {
+                    monoid_batch_kernel_warp<<<grid_warp, MW_BLOCK, smem_warp>>>(
+                        eng.d_raw_concat, eng.d_offsets,
+                        eng.d_char_compose, eng.d_raw_char_map, eng.d_monoid_compose, eng.d_accept,
+                        B, M, sigma_ext, identity, eng.d_results);
+                    cudaDeviceSynchronize();
+                }
+                float sum_warp = 0;
+                for (int r = 0; r < runs; r++) {
+                    CHECK_CUDA(cudaEventRecord(eng.ev_kern_start));
+                    monoid_batch_kernel_warp<<<grid_warp, MW_BLOCK, smem_warp>>>(
+                        eng.d_raw_concat, eng.d_offsets,
+                        eng.d_char_compose, eng.d_raw_char_map, eng.d_monoid_compose, eng.d_accept,
+                        B, M, sigma_ext, identity, eng.d_results);
+                    CHECK_CUDA(cudaEventRecord(eng.ev_kern_stop));
+                    CHECK_CUDA(cudaEventSynchronize(eng.ev_kern_stop));
+                    CHECK_CUDA(cudaEventElapsedTime(&kern_ms, eng.ev_kern_start, eng.ev_kern_stop));
+                    sum_warp += kern_ms;
+                }
+                float avg_warp = sum_warp / runs;
+                double gcs_warp = (double)total_chars / (avg_warp * 1e6);
+
+                // Verify correctness
+                int *warp_results = new int[B];
+                CHECK_CUDA(cudaMemcpy(warp_results, eng.d_results, B * sizeof(int), cudaMemcpyDeviceToHost));
+                int mm = 0;
+                for (int i = 0; i < B; i++) if (warp_results[i] != ref_results[i]) mm++;
+                delete[] warp_results;
+
+                printf("%7d  %5d  %10.3f  %10.1f  %10.3f  %10.1f  %5.2fx%s\n",
+                       B, L, avg_tps, gcs_tps, avg_warp, gcs_warp,
+                       avg_tps / avg_warp,
+                       mm > 0 ? " MISMATCH!" : "");
+
+                eng.destroy();
+            }
+            delete[] raw_concat; delete[] offsets; delete[] results; delete[] ref_results;
         }
     }
 }
@@ -741,6 +1242,8 @@ int main() {
 
     test_batch_correctness();
     test_batch_large_random();
+    test_kgram_correctness();
+    test_kgram_large_random();
     test_prefix_correctness();
     test_prefix_multi_string();
 

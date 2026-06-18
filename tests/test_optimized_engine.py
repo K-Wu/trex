@@ -63,8 +63,8 @@ class TestOptimizedEngineAutoSelect:
         assert info["representation"] == "dfa", (
             f"Expected DFA representation, got {info['representation']}"
         )
-        assert info["scan_backend"] in ("monoid", "monoid+kgram"), (
-            f"Expected monoid or monoid+kgram backend, got {info['scan_backend']}"
+        assert info["scan_backend"] in ("monoid", "monoid+kgram", "monoid_batch+gpu"), (
+            f"Expected monoid-family backend, got {info['scan_backend']}"
         )
 
     def test_config_info_has_required_fields(self):
@@ -191,13 +191,17 @@ class TestOptimizedEngineTiming:
         assert all(isinstance(r, bool) for r in results), "All results must be bool"
 
         assert isinstance(timing, dict), "Second element must be dict"
-        required_timing_keys = {"total_seconds", "per_string_seconds", "n_strings"}
-        missing = required_timing_keys - set(timing.keys())
-        assert not missing, f"timing dict missing keys: {missing}"
-
-        assert timing["n_strings"] == len(strings)
-        assert timing["total_seconds"] >= 0.0
-        assert timing["per_string_seconds"] >= 0.0
+        if "kernel_ms" in timing:
+            assert "total_ms" in timing, "GPU timing must have total_ms"
+            assert timing["kernel_ms"] >= 0.0
+            assert timing["total_ms"] >= 0.0
+        else:
+            required_timing_keys = {"total_seconds", "per_string_seconds", "n_strings"}
+            missing = required_timing_keys - set(timing.keys())
+            assert not missing, f"timing dict missing keys: {missing}"
+            assert timing["n_strings"] == len(strings)
+            assert timing["total_seconds"] >= 0.0
+            assert timing["per_string_seconds"] >= 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
