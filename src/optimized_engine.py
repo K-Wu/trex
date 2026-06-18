@@ -69,6 +69,7 @@ class OptimizedEngine:
         self._kgram_gpu = None  # KGramGPUEngine (GPU)
         self._monoid_batch_gpu = None  # MonoidBatchEngine (GPU)
         self._prefix_compose_gpu = None  # PrefixComposeEngine (GPU)
+        self._fp16_tc_gpu = None  # FP16EvolutionEngine (GPU)
 
         self._representation = None   # "dfa" | "nfa"
         self._scan_backend = None     # "sequential" | "monoid" | "monoid+kgram" | "nfa"
@@ -100,11 +101,14 @@ class OptimizedEngine:
         elif config == "prefix+gpu":
             self._force_baseline()
             self._setup_prefix_gpu()
+        elif config == "fp16_tc+gpu":
+            self._force_baseline()
+            self._setup_fp16_tc_gpu()
         else:
             raise ValueError(f"Unknown config: {config!r}. "
                              f"Choose from None, 'monoid', 'monoid+kgram', 'baseline', 'nfa', "
                              f"'monoid+gpu', 'batched+gpu', 'kgram+gpu', 'monoid_batch+gpu', "
-                             f"'prefix+gpu'.")
+                             f"'prefix+gpu', 'fp16_tc+gpu'.")
 
     # ── Private setup helpers ────────────────────────────────────────────────
 
@@ -151,7 +155,19 @@ class OptimizedEngine:
                 except Exception:
                     pass
             else:
-                # M > 255: monoid batch can't handle this, try prefix compose
+                # M > 255: monoid batch can't handle this
+                # Try FP16 TC evolution first (Tier 2), then prefix compose
+                if n_states <= 64:
+                    try:
+                        self._setup_fp16_tc_gpu()
+                        self._representation = "dfa"
+                        self._selection_reason = (
+                            f"DFA has {n_states} states; monoid size {md.size} > 255; "
+                            f"auto-selected fp16_tc+gpu"
+                        )
+                        return
+                    except Exception:
+                        pass
                 try:
                     self._setup_prefix_gpu()
                     self._representation = "dfa"
@@ -292,6 +308,20 @@ class OptimizedEngine:
             f'GPU prefix compose (N={self._dm.n_states})'
         )
 
+    def _setup_fp16_tc_gpu(self):
+        self._build_dfa()
+        from src.gpu_bridge_fp16_evolution import FP16EvolutionGPUSimulator
+        sim = FP16EvolutionGPUSimulator()
+        self._fp16_tc_gpu = sim.create_engine(
+            self._dm,
+            max_total_chars=1 << 29,
+            max_batch=1 << 19,
+        )
+        self._scan_backend = 'fp16_tc+gpu'
+        self._selection_reason = (
+            f'GPU FP16 TC evolution (N={self._dm.n_states})'
+        )
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -326,6 +356,8 @@ class OptimizedEngine:
 
     def _match_one(self, s: str) -> bool:
         """Dispatch a single string to the active backend."""
+        if self._fp16_tc_gpu is not None:
+            return self._fp16_tc_gpu.simulate_batch([s])[0]
         if self._prefix_compose_gpu is not None:
             return self._prefix_compose_gpu.simulate_batch([s])[0]
         if self._monoid_batch_gpu is not None:
@@ -343,6 +375,8 @@ class OptimizedEngine:
 
     def match_batch(self, strings: list) -> list:
         """Match a list of strings. Returns list[bool]."""
+        if self._fp16_tc_gpu is not None:
+            return self._fp16_tc_gpu.simulate_batch(strings)
         if self._prefix_compose_gpu is not None:
             return self._prefix_compose_gpu.simulate_batch(strings)
         if self._monoid_batch_gpu is not None:
@@ -361,6 +395,9 @@ class OptimizedEngine:
         timing_dict keys: total_seconds, per_string_seconds, n_strings.
         For GPU config: kernel_ms and total_ms keys are also provided.
         """
+        if self._fp16_tc_gpu is not None:
+            results, kern_ms, total_ms = self._fp16_tc_gpu.simulate_batch_timed(strings)
+            return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
         if self._prefix_compose_gpu is not None:
             results, kern_ms, total_ms = self._prefix_compose_gpu.simulate_batch_timed(strings)
             return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
