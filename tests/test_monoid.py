@@ -442,5 +442,94 @@ class TestMonoidGPU:
         engine.destroy()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. TestPrecomputeBatchTables — validate GPU-friendly tables
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPrecomputeBatchTables:
+    """Validate precompute_batch_tables against simulate_monoid."""
+
+    @pytest.mark.parametrize("pattern_name", ["abb", "even_a", "identifier"])
+    def test_tables_reproduce_simulate_monoid(self, pattern_name):
+        from src.monoid import precompute_batch_tables
+        dm, dfa = _make_dm(pattern_name)
+        md = compute_monoid(dm)
+        assert md is not None
+
+        tables = precompute_batch_tables(md, dm)
+        char_compose = tables['char_compose']
+        raw_char_map = tables['raw_char_map']
+        accept = tables['accept']
+        M = tables['M']
+        sigma_ext = tables['sigma_ext']
+        identity = tables['identity_idx']
+
+        alphabet = _get_alphabet(pattern_name)
+        rng = random.Random(42)
+        for _ in range(200):
+            length = rng.randint(0, 100)
+            s = "".join(rng.choice(alphabet) for _ in range(length))
+
+            curr = identity
+            for ch in s:
+                ch_idx = raw_char_map[ord(ch)]
+                curr = char_compose[curr * sigma_ext + ch_idx]
+            batch_accept = bool(accept[curr])
+
+            ref_accept = simulate_monoid(md, dm, s)
+            assert batch_accept == ref_accept, (
+                f"Mismatch for '{s[:40]}': batch={batch_accept}, ref={ref_accept}"
+            )
+
+    @pytest.mark.parametrize("pattern_name", ["abb", "even_a"])
+    def test_identity_column(self, pattern_name):
+        from src.monoid import precompute_batch_tables
+        dm, _ = _make_dm(pattern_name)
+        md = compute_monoid(dm)
+        tables = precompute_batch_tables(md, dm)
+        char_compose = tables['char_compose']
+        raw_char_map = tables['raw_char_map']
+        sigma_ext = tables['sigma_ext']
+
+        z_idx = raw_char_map[ord('z')]
+        assert z_idx == sigma_ext - 1
+
+        for m in range(tables['M']):
+            assert char_compose[m * sigma_ext + z_idx] == m
+
+    @pytest.mark.parametrize("pattern_name", ["abb", "even_a"])
+    def test_monoid_compose_table(self, pattern_name):
+        from src.monoid import precompute_batch_tables
+        dm, _ = _make_dm(pattern_name)
+        md = compute_monoid(dm)
+        tables = precompute_batch_tables(md, dm)
+        monoid_compose = tables['monoid_compose']
+        M = tables['M']
+
+        for i in range(M):
+            for j in range(M):
+                expected = int(md.compose_table[i, j])
+                got = int(monoid_compose[i * M + j])
+                assert got == expected
+
+    def test_shapes(self):
+        from src.monoid import precompute_batch_tables
+        dm, _ = _make_dm("abb")
+        md = compute_monoid(dm)
+        tables = precompute_batch_tables(md, dm)
+
+        M = tables['M']
+        sigma_ext = tables['sigma_ext']
+        assert tables['char_compose'].shape == (M * sigma_ext,)
+        assert tables['char_compose'].dtype == np.uint8
+        assert tables['raw_char_map'].shape == (256,)
+        assert tables['raw_char_map'].dtype == np.uint8
+        assert tables['accept'].shape == (M,)
+        assert tables['accept'].dtype == np.uint8
+        assert tables['monoid_compose'].shape == (M * M,)
+        assert tables['monoid_compose'].dtype == np.uint8
+        assert sigma_ext == len(dm.alphabet) + 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

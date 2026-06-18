@@ -403,3 +403,49 @@ class TestKGramGPUIntegration:
         expected = engine_base.match_batch(strings)
         actual = engine_kgram.match_batch(strings)
         assert actual == expected, f"kgram+gpu mismatch for {pattern_name}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Monoid Batch GPU tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _monoid_batch_gpu_available():
+    try:
+        from src.gpu_bridge_monoid_batch import MonoidBatchGPUSimulator
+        MonoidBatchGPUSimulator()
+        return True
+    except Exception:
+        return False
+
+skip_no_monoid_batch_gpu = pytest.mark.skipif(
+    not _monoid_batch_gpu_available(),
+    reason="monoid batch GPU not available"
+)
+
+
+@skip_no_monoid_batch_gpu
+class TestMonoidBatchGPUConfig:
+
+    def test_monoid_batch_gpu_config(self):
+        engine = OptimizedEngine("(a|b)*abb", config="monoid_batch+gpu")
+        info = engine.config_info
+        assert info["scan_backend"] == "monoid_batch+gpu"
+
+    def test_monoid_batch_gpu_correctness(self):
+        engine = OptimizedEngine("(a|b)*abb", config="monoid_batch+gpu")
+        baseline = OptimizedEngine("(a|b)*abb", config="baseline")
+        rng = random.Random(42)
+        strings = ["".join(rng.choice("ab") for _ in range(rng.randint(0, 200)))
+                    for _ in range(100)]
+        gpu_results = engine.match_batch(strings)
+        cpu_results = baseline.match_batch(strings)
+        assert gpu_results == cpu_results
+
+    def test_monoid_batch_gpu_timed(self):
+        engine = OptimizedEngine("(a|b)*abb", config="monoid_batch+gpu")
+        rng = random.Random(99)
+        strings = ["".join(rng.choice("ab") for _ in range(100)) for _ in range(500)]
+        results, timing = engine.match_batch_timed(strings)
+        assert len(results) == 500
+        assert 'kernel_ms' in timing
+        assert timing['kernel_ms'] > 0

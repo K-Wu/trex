@@ -190,3 +190,53 @@ def simulate_monoid(md: MonoidData, dm: DFAMatrices, input_str: str) -> bool:
         c_idx = md.char_to_monoid.get(ch, md.identity_idx)
         acc = int(md.compose_table[c_idx, acc])
     return bool(md.accept_table[acc])
+
+
+def precompute_batch_tables(md: MonoidData, dm: DFAMatrices) -> dict:
+    """Build GPU-friendly tables for the monoid batch kernel.
+
+    Returns a dict with keys:
+        char_compose   (M * sigma_ext,) uint8 — fused compose table
+                       char_compose[curr * sigma_ext + ch_idx] = next monoid element
+        raw_char_map   (256,) uint8 — maps raw ASCII byte to DFA char index
+                       unmapped bytes map to sigma (identity column)
+        accept         (M,) uint8 — 1 if monoid element is accepting
+        monoid_compose (M * M,) uint8 — M×M compose table for tree reduce
+        M              int — monoid size (must be ≤ 255 for uint8)
+        sigma_ext      int — len(alphabet) + 1 (extra identity column)
+        identity_idx   int — index of identity monoid element
+    """
+    M = md.size
+    if M > 255:
+        raise ValueError(f"Monoid size {M} exceeds uint8 limit (255)")
+
+    sigma = len(dm.alphabet)
+    sigma_ext = sigma + 1
+
+    char_compose = np.zeros((M, sigma_ext), dtype=np.uint8)
+    for ch_name, ch_dfa_idx in dm.char_to_idx.items():
+        ch_monoid = md.char_to_monoid[ch_name]
+        for m in range(M):
+            char_compose[m, ch_dfa_idx] = int(md.compose_table[ch_monoid, m])
+    for m in range(M):
+        char_compose[m, sigma] = m
+
+    raw_char_map = np.full(256, sigma, dtype=np.uint8)
+    for ch_name, ch_dfa_idx in dm.char_to_idx.items():
+        raw_char_map[ord(ch_name)] = ch_dfa_idx
+
+    accept = np.ascontiguousarray(md.accept_table.astype(np.uint8))
+
+    monoid_compose = np.ascontiguousarray(
+        md.compose_table.astype(np.uint8).reshape(-1)
+    )
+
+    return {
+        'char_compose': np.ascontiguousarray(char_compose.reshape(-1)),
+        'raw_char_map': raw_char_map,
+        'accept': accept,
+        'monoid_compose': monoid_compose,
+        'M': M,
+        'sigma_ext': sigma_ext,
+        'identity_idx': md.identity_idx,
+    }
