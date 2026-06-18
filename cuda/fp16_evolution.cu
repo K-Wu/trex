@@ -10,6 +10,11 @@
  * The select loop directly assigns accumulator values to the state tile.
  *
  * V1: store_matrix_sync → shared memory → select → S_sh (smem path)
+ * V2: register-level select from frag_acc.x[i] → S_sh (register path)
+ *     Eliminates store_matrix_sync + smem round-trip for accumulators.
+ *     FP16 accumulator layout (same as INT8):
+ *       row = lane/4 + ((i>>1)&1)*8
+ *       col = (lane%4)*2 + (i&1) + (i>>2)*8
  *
  * Threading model:
  *   Each warp handles 16 consecutive columns (strings) -- one WMMA 16x16 tile
@@ -159,6 +164,113 @@ __global__ void fp16_evolution_binary_kernel(
 }
 
 
+// ---- FP16 Binary Kernel V2 (register path) ------------------------------
+//
+// Shared memory layout (no accumulator buffers):
+//   T0_sh[16×16]      512B   (half, transition matrix char 0)
+//   T1_sh[16×16]      512B   (half, transition matrix char 1)
+//   S_sh[4×16×16]     2048B  (half, state tiles for 4 warps, col-major)
+//   Total:             3072B  (vs 7168B for V1)
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 16)
+fp16_evolution_binary_v2_kernel(
+    const half    *__restrict__ T0_global,
+    const half    *__restrict__ T1_global,
+    const uint8_t *__restrict__ input,
+    const half    *__restrict__ accept_mask,
+    const half    *__restrict__ start_vec,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int block_col_start = blockIdx.x * COLS_PER_BLOCK;
+    int warp_col_start = block_col_start + warp_in_block * TILE;
+
+    extern __shared__ char smem_raw[];
+    half *T0_sh = (half *)smem_raw;
+    half *T1_sh = T0_sh + TILE_ELEMS;
+    half *S_base = T1_sh + TILE_ELEMS;
+    half *S_sh = S_base + warp_in_block * TILE_ELEMS;
+
+    for (int e = threadIdx.x; e < TILE_ELEMS; e += blockDim.x) {
+        T0_sh[e] = T0_global[e];
+        T1_sh[e] = T1_global[e];
+    }
+    for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+        int row = e % TILE;
+        S_sh[e] = start_vec[row];
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_T0, frag_T1;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_S;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_acc0, frag_acc1;
+
+    wmma::load_matrix_sync(frag_T0, T0_sh, TILE);
+    wmma::load_matrix_sync(frag_T1, T1_sh, TILE);
+
+    half h_zero = __float2half(0.0f);
+
+    int col_lo = (lane & 3) * 2;
+    int col_hi = col_lo + 8;
+    int row_lo = lane >> 2;
+    int row_hi = row_lo + 8;
+
+    for (int t = 0; t < L; t++) {
+        wmma::load_matrix_sync(frag_S, S_sh, TILE);
+
+        wmma::fill_fragment(frag_acc0, h_zero);
+        wmma::mma_sync(frag_acc0, frag_T0, frag_S, frag_acc0);
+        wmma::fill_fragment(frag_acc1, h_zero);
+        wmma::mma_sync(frag_acc1, frag_T1, frag_S, frag_acc1);
+
+        uint8_t my_ch = 2;
+        if (lane < TILE) {
+            int sid = warp_col_start + lane;
+            if (sid < B_padded) my_ch = input[t * B_padded + sid];
+        }
+
+        uint8_t ch0 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo);
+        uint8_t ch1 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo + 1);
+        uint8_t ch2 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi);
+        uint8_t ch3 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi + 1);
+
+        #define FP16_REGSEL(EI, COL, ROW, CH) \
+            if ((CH) < 2) { \
+                S_sh[(COL) * TILE + (ROW)] = ((CH) == 0) ? frag_acc0.x[EI] : frag_acc1.x[EI]; \
+            }
+
+        FP16_REGSEL(0, col_lo,     row_lo, ch0)
+        FP16_REGSEL(1, col_lo + 1, row_lo, ch1)
+        FP16_REGSEL(2, col_lo,     row_hi, ch0)
+        FP16_REGSEL(3, col_lo + 1, row_hi, ch1)
+        FP16_REGSEL(4, col_hi,     row_lo, ch2)
+        FP16_REGSEL(5, col_hi + 1, row_lo, ch3)
+        FP16_REGSEL(6, col_hi,     row_hi, ch2)
+        FP16_REGSEL(7, col_hi + 1, row_hi, ch3)
+
+        #undef FP16_REGSEL
+
+        __syncwarp();
+    }
+
+    for (int col = lane; col < TILE; col += WARP_SIZE) {
+        int string_id = warp_col_start + col;
+        if (string_id >= B) continue;
+        int accepted = 0;
+        for (int r = 0; r < TILE; r++) {
+            if (__hgt(S_sh[col * TILE + r], h_zero) &&
+                __hgt(accept_mask[r], h_zero)) {
+                accepted = 1;
+                break;
+            }
+        }
+        results[string_id] = accepted;
+    }
+}
+
+
 // ---- Engine Struct --------------------------------------------------------
 
 struct FP16Engine {
@@ -167,6 +279,7 @@ struct FP16Engine {
     int max_B;
     int max_L;
     int B_padded_max;
+    int kernel_variant;    // 1=V1(smem), 2=V2(register)
 
     // Device memory
     half    *d_T;          // [sigma * N * N] transition matrices
@@ -184,6 +297,7 @@ struct FP16Engine {
         sigma = sig;
         max_B = maxB;
         max_L = maxL;
+        kernel_variant = 2;
         B_padded_max = ((maxB + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
 
         int T_count = sig * n * n;
@@ -244,12 +358,22 @@ struct FP16Engine {
         CHECK_CUDA(cudaEventRecord(ev_kern_start));
 
         int n_blocks = B_padded / COLS_PER_BLOCK;
-        // smem: T0(512) + T1(512) + S(2048) + acc0(2048) + acc1(2048) = 7168
-        int smem = (2 + WARPS_PER_BLOCK * 3) * TILE_ELEMS * (int)sizeof(half);
-        fp16_evolution_binary_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
-            d_T, d_T + TILE_ELEMS,
-            d_input, d_accept, d_start_vec,
-            B, B_padded, L, d_results);
+
+        if (kernel_variant == 2) {
+            // V2: T0(512) + T1(512) + S(2048) = 3072
+            int smem = (2 + WARPS_PER_BLOCK) * TILE_ELEMS * (int)sizeof(half);
+            fp16_evolution_binary_v2_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                d_T, d_T + TILE_ELEMS,
+                d_input, d_accept, d_start_vec,
+                B, B_padded, L, d_results);
+        } else {
+            // V1: T0(512) + T1(512) + S(2048) + acc0(2048) + acc1(2048) = 7168
+            int smem = (2 + WARPS_PER_BLOCK * 3) * TILE_ELEMS * (int)sizeof(half);
+            fp16_evolution_binary_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                d_T, d_T + TILE_ELEMS,
+                d_input, d_accept, d_start_vec,
+                B, B_padded, L, d_results);
+        }
         CHECK_CUDA(cudaGetLastError());
 
         CHECK_CUDA(cudaEventRecord(ev_kern_stop));
@@ -348,6 +472,13 @@ int fp16_engine_dispatch(
 
     return g_fp16_engine.dispatch(input.data(), B, L, B_padded,
                                   results, kernel_ms, total_ms);
+}
+
+int fp16_engine_set_variant(int variant) {
+    if (!g_fp16_engine.initialized) return -1;
+    if (variant < 1 || variant > 2) return -2;
+    g_fp16_engine.kernel_variant = variant;
+    return 0;
 }
 
 void fp16_engine_destroy(void) {
@@ -574,8 +705,6 @@ static void test_fp16_invariant() {
 }
 
 static void bench_throughput() {
-    printf("\n=== FP16 TC Throughput Benchmark (binary, N=16) ===\n");
-
     int N = TILE;
     int sigma = 2;
     float trans[2 * TILE_ELEMS];
@@ -598,43 +727,46 @@ static void bench_throughput() {
     int lengths[]     = {128, 512, 2048};
     int n_batches = 5, n_lengths = 3;
 
-    printf("  %8s  %6s  |  %8s  %8s\n", "B", "L", "Gc/s", "kern_ms");
-    printf("  %s\n", "-------------------------------------");
+    for (int variant = 1; variant <= 2; variant++) {
+        printf("\n=== FP16 TC V%d Throughput Benchmark (binary, N=16) ===\n", variant);
+        printf("  %8s  %6s  |  %8s  %8s\n", "B", "L", "Gc/s", "kern_ms");
+        printf("  %s\n", "-------------------------------------");
 
-    for (int bi = 0; bi < n_batches; bi++) {
-        for (int li = 0; li < n_lengths; li++) {
-            int B = batch_sizes[bi];
-            int L = lengths[li];
-            int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+        for (int bi = 0; bi < n_batches; bi++) {
+            for (int li = 0; li < n_lengths; li++) {
+                int B = batch_sizes[bi];
+                int L = lengths[li];
+                int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
 
-            fp16_engine_init(trans, accept, start_vec, N, sigma, B_padded, L);
+                fp16_engine_init(trans, accept, start_vec, N, sigma, B_padded, L);
+                fp16_engine_set_variant(variant);
 
-            srand(42);
-            size_t input_size = (size_t)L * B_padded;
-            std::vector<uint8_t> input(input_size, (uint8_t)sigma);
-            for (int b = 0; b < B; b++)
-                for (int t = 0; t < L; t++)
-                    input[t * B_padded + b] = rand() % 2;
+                srand(42);
+                size_t input_size = (size_t)L * B_padded;
+                std::vector<uint8_t> input(input_size, (uint8_t)sigma);
+                for (int b = 0; b < B; b++)
+                    for (int t = 0; t < L; t++)
+                        input[t * B_padded + b] = rand() % 2;
 
-            std::vector<int> results(B);
+                std::vector<int> results(B);
 
-            // Warmup
-            for (int w = 0; w < 3; w++)
-                g_fp16_engine.dispatch(input.data(), B, L, B_padded, results.data(), nullptr, nullptr);
+                for (int w = 0; w < 3; w++)
+                    g_fp16_engine.dispatch(input.data(), B, L, B_padded, results.data(), nullptr, nullptr);
 
-            int iters = 20;
-            float total_km = 0;
-            for (int it = 0; it < iters; it++) {
-                float km;
-                g_fp16_engine.dispatch(input.data(), B, L, B_padded, results.data(), &km, nullptr);
-                total_km += km;
+                int iters = 20;
+                float total_km = 0;
+                for (int it = 0; it < iters; it++) {
+                    float km;
+                    g_fp16_engine.dispatch(input.data(), B, L, B_padded, results.data(), &km, nullptr);
+                    total_km += km;
+                }
+                float avg_km = total_km / iters;
+                double gchs = (double)B * L / (avg_km * 1e6);
+
+                printf("  %8d  %6d  |  %8.1f  %8.3f\n", B, L, gchs, avg_km);
+
+                fp16_engine_destroy();
             }
-            float avg_km = total_km / iters;
-            double gchs = (double)B * L / (avg_km * 1e6);
-
-            printf("  %8d  %6d  |  %8.1f  %8.3f\n", B, L, gchs, avg_km);
-
-            fp16_engine_destroy();
         }
     }
 }
@@ -658,6 +790,44 @@ int main() {
     test_basic_correctness();
     test_large_random();
     test_fp16_invariant();
+
+    // V1 vs V2 cross-validation
+    {
+        printf("\n--- test_v1_v2_cross_validation (4096 x 256) ---\n");
+        int N2 = TILE, sigma2 = 2;
+        float trans2[2 * TILE_ELEMS], accept2[TILE], start2[TILE];
+        memset(trans2, 0, sizeof(trans2));
+        memset(accept2, 0, sizeof(accept2));
+        memset(start2, 0, sizeof(start2));
+        accept2[0] = 1.0f; start2[0] = 1.0f;
+        for (int c = 0; c < 2; c++)
+            for (int s = 2; s < TILE; s++)
+                trans2[c * TILE_ELEMS + s * TILE + s] = 1.0f;
+        trans2[0 * TILE_ELEMS + 1 * TILE + 0] = 1.0f;
+        trans2[0 * TILE_ELEMS + 0 * TILE + 1] = 1.0f;
+        trans2[1 * TILE_ELEMS + 0 * TILE + 0] = 1.0f;
+        trans2[1 * TILE_ELEMS + 1 * TILE + 1] = 1.0f;
+        int B2 = 4096, L2 = 256;
+        int B2_p = ((B2 + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+        srand(99);
+        size_t isz = (size_t)L2 * B2_p;
+        std::vector<uint8_t> inp(isz, (uint8_t)sigma2);
+        for (int b = 0; b < B2; b++)
+            for (int t = 0; t < L2; t++)
+                inp[t * B2_p + b] = rand() % 2;
+        std::vector<int> res1(B2), res2(B2);
+        fp16_engine_init(trans2, accept2, start2, N2, sigma2, B2_p, L2);
+        fp16_engine_set_variant(1);
+        g_fp16_engine.dispatch(inp.data(), B2, L2, B2_p, res1.data(), nullptr, nullptr);
+        fp16_engine_set_variant(2);
+        g_fp16_engine.dispatch(inp.data(), B2, L2, B2_p, res2.data(), nullptr, nullptr);
+        int mm = 0;
+        for (int b = 0; b < B2; b++) if (res1[b] != res2[b]) mm++;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "v1_v2_cross B=%d L=%d (%d mismatches)", B2, L2, mm);
+        check(msg, mm == 0);
+        fp16_engine_destroy();
+    }
 
     printf("\n=== Results: %d / %d passed ===\n", g_pass, g_tests);
     if (g_pass != g_tests) {

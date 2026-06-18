@@ -164,6 +164,9 @@ class FP16EvolutionGPUSimulator:
         self.lib.fp16_engine_destroy.restype = None
         self.lib.fp16_engine_destroy.argtypes = []
 
+        self.lib.fp16_engine_set_variant.restype = ctypes.c_int
+        self.lib.fp16_engine_set_variant.argtypes = [ctypes.c_int]
+
         self.lib.fp16_engine_dispatch.restype = ctypes.c_int
         self.lib.fp16_engine_dispatch.argtypes = [
             ctypes.POINTER(ctypes.c_uint8),   # raw_concat
