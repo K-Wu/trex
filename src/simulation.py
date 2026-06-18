@@ -271,6 +271,32 @@ def simulate_batch_matrix(dm: DFAMatrices, strings: list[str]) -> list[bool]:
     return results
 
 
+def precompute_tmap(dm: DFAMatrices) -> np.ndarray:
+    """Build fused transition map: tmap[byte_val * N + state] = dest_state.
+
+    For each raw byte value (0-255), maps each DFA state to its destination.
+    Unmapped characters act as identity (state maps to itself).
+    Table size: 256 * N bytes (4 KB for N=16).
+    """
+    N = dm.n_states
+    tmap = np.zeros(256 * N, dtype=np.uint8)
+
+    # Default: identity for all bytes and all states
+    for s in range(N):
+        for byte_val in range(256):
+            tmap[byte_val * N + s] = s
+
+    # Overwrite with actual transitions for alphabet characters
+    for ch_name in dm.alphabet:
+        byte_val = ord(ch_name)
+        T = dm.matrices[ch_name]
+        for s in range(dm.n_states_raw):
+            dst = int(np.argmax(T[:, s]))
+            tmap[byte_val * N + s] = dst
+
+    return tmap
+
+
 if __name__ == '__main__':
     from src.regex_to_dfa import compile_regex
 

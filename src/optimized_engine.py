@@ -68,6 +68,7 @@ class OptimizedEngine:
         self._batched_gpu = None  # BatchedEvolutionEngine (GPU)
         self._kgram_gpu = None  # KGramGPUEngine (GPU)
         self._monoid_batch_gpu = None  # MonoidBatchEngine (GPU)
+        self._prefix_compose_gpu = None  # PrefixComposeEngine (GPU)
 
         self._representation = None   # "dfa" | "nfa"
         self._scan_backend = None     # "sequential" | "monoid" | "monoid+kgram" | "nfa"
@@ -96,10 +97,14 @@ class OptimizedEngine:
         elif config == "monoid_batch+gpu":
             self._force_monoid()
             self._setup_monoid_batch_gpu()
+        elif config == "prefix+gpu":
+            self._force_baseline()
+            self._setup_prefix_gpu()
         else:
             raise ValueError(f"Unknown config: {config!r}. "
                              f"Choose from None, 'monoid', 'monoid+kgram', 'baseline', 'nfa', "
-                             f"'monoid+gpu', 'batched+gpu', 'kgram+gpu', 'monoid_batch+gpu'.")
+                             f"'monoid+gpu', 'batched+gpu', 'kgram+gpu', 'monoid_batch+gpu', "
+                             f"'prefix+gpu'.")
 
     # ── Private setup helpers ────────────────────────────────────────────────
 
@@ -145,6 +150,18 @@ class OptimizedEngine:
                     return
                 except Exception:
                     pass
+            else:
+                # M > 255: monoid batch can't handle this, try prefix compose
+                try:
+                    self._setup_prefix_gpu()
+                    self._representation = "dfa"
+                    self._selection_reason = (
+                        f"DFA has {n_states} states; monoid size {md.size} > 255; "
+                        f"auto-selected prefix+gpu"
+                    )
+                    return
+                except Exception:
+                    pass
             k = auto_k(alphabet_size)
             self._kg = precompute_kgrams(self._dm, k, monoid=self._md)
             self._kgram_k = k
@@ -154,7 +171,17 @@ class OptimizedEngine:
                 f"DFA has {n_states} states; monoid size {md.size} fits; using monoid+kgram"
             )
         else:
-            # Monoid too large — fall back to sequential
+            # Monoid too large — try prefix compose, fall back to sequential
+            try:
+                self._setup_prefix_gpu()
+                self._representation = "dfa"
+                self._selection_reason = (
+                    f"DFA has {n_states} states; monoid exceeds cap; "
+                    f"auto-selected prefix+gpu"
+                )
+                return
+            except Exception:
+                pass
             self._representation = "dfa"
             self._scan_backend = "sequential"
             self._selection_reason = (
@@ -251,6 +278,20 @@ class OptimizedEngine:
             f'N={self._dm.n_states})'
         )
 
+    def _setup_prefix_gpu(self):
+        self._build_dfa()
+        from src.gpu_bridge_prefix_compose import PrefixComposeGPUSimulator
+        sim = PrefixComposeGPUSimulator()
+        self._prefix_compose_gpu = sim.create_engine(
+            self._dm,
+            max_total_chars=1 << 29,
+            max_batch=1 << 19,
+        )
+        self._scan_backend = 'prefix+gpu'
+        self._selection_reason = (
+            f'GPU prefix compose (N={self._dm.n_states})'
+        )
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     @property
@@ -285,6 +326,8 @@ class OptimizedEngine:
 
     def _match_one(self, s: str) -> bool:
         """Dispatch a single string to the active backend."""
+        if self._prefix_compose_gpu is not None:
+            return self._prefix_compose_gpu.simulate_batch([s])[0]
         if self._monoid_batch_gpu is not None:
             return self._monoid_batch_gpu.simulate_batch([s])[0]
         if self._gpu_engine is not None:
@@ -300,6 +343,8 @@ class OptimizedEngine:
 
     def match_batch(self, strings: list) -> list:
         """Match a list of strings. Returns list[bool]."""
+        if self._prefix_compose_gpu is not None:
+            return self._prefix_compose_gpu.simulate_batch(strings)
         if self._monoid_batch_gpu is not None:
             return self._monoid_batch_gpu.simulate_batch(strings)
         if self._gpu_engine is not None:
@@ -316,6 +361,9 @@ class OptimizedEngine:
         timing_dict keys: total_seconds, per_string_seconds, n_strings.
         For GPU config: kernel_ms and total_ms keys are also provided.
         """
+        if self._prefix_compose_gpu is not None:
+            results, kern_ms, total_ms = self._prefix_compose_gpu.simulate_batch_timed(strings)
+            return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
         if self._monoid_batch_gpu is not None:
             results, kern_ms, total_ms = self._monoid_batch_gpu.simulate_batch_timed(strings)
             return results, {'kernel_ms': kern_ms, 'total_ms': total_ms}
