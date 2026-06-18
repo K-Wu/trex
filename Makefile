@@ -45,7 +45,11 @@ SRC_PREFIX = $(CUDA_DIR)/prefix_compose.cu
 EXE_PREFIX = $(BUILD_DIR)/prefix_compose
 LIB_PREFIX = $(BUILD_DIR)/libprefix_compose.so
 
-all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID) $(EXE_BATCHED) $(LIB_BATCHED) $(EXE_KGRAM) $(LIB_KGRAM) $(EXE_MONOID_BATCH) $(LIB_MONOID_BATCH) $(EXE_PREFIX) $(LIB_PREFIX)
+SRC_FP16 = $(CUDA_DIR)/fp16_evolution.cu
+EXE_FP16 = $(BUILD_DIR)/fp16_evolution
+LIB_FP16 = $(BUILD_DIR)/libfp16_evolution.so
+
+all: $(BUILD_DIR) $(EXE) $(LIB) $(EXE_V4) $(LIB_V4) $(EXE_MONOID) $(LIB_MONOID) $(EXE_BATCHED) $(LIB_BATCHED) $(EXE_KGRAM) $(LIB_KGRAM) $(EXE_MONOID_BATCH) $(LIB_MONOID_BATCH) $(EXE_PREFIX) $(LIB_PREFIX) $(EXE_FP16) $(LIB_FP16)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -92,6 +96,12 @@ $(EXE_PREFIX): $(SRC_PREFIX) | $(BUILD_DIR)
 $(LIB_PREFIX): $(SRC_PREFIX) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
 
+$(EXE_FP16): $(SRC_FP16) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $<
+
+$(LIB_FP16): $(SRC_FP16) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -DBUILD_LIB -shared -Xcompiler -fPIC -o $@ $<
+
 $(EXE_PROFILE): $(SRC_PROFILE) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -lineinfo -o $@ $<
 
@@ -125,6 +135,9 @@ test-monoid-batch: $(EXE_MONOID_BATCH)
 test-prefix: $(EXE_PREFIX)
 	./$(EXE_PREFIX)
 
+test-fp16: $(EXE_FP16)
+	./$(EXE_FP16)
+
 test-all: test-gpu test-py
 
 bench-cpu:
@@ -138,4 +151,4 @@ eval: $(LIB)
 
 bench-all: bench-cpu bench-gpu
 
-.PHONY: all clean test-py test-gpu test-v4 test-monoid test-batched test-kgram test-monoid-batch test-prefix test-all bench-cpu bench-gpu eval bench-all profile
+.PHONY: all clean test-py test-gpu test-v4 test-monoid test-batched test-kgram test-monoid-batch test-prefix test-fp16 test-all bench-cpu bench-gpu eval bench-all profile
