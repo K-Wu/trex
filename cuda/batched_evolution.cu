@@ -173,6 +173,127 @@ __global__ void batched_evolution_binary_kernel(
 }
 
 
+// ---- Binary Kernel V2 (register-level select, no acc shared memory) --------
+//
+// Same algorithm as the binary kernel above, but eliminates the
+// store_matrix_sync calls for accumulators. After MMA, each thread directly
+// selects from frag_acc0.x[i] or frag_acc1.x[i] based on the input character,
+// thresholds, and writes to S_sh.
+//
+// Relies on the empirically probed WMMA accumulator fragment layout:
+//   row = lane/4 + ((i>>1)&1)*8
+//   col = (lane%4)*2 + (i&1) + (i>>2)*8
+//
+// Shared memory: T0_sh(256) + T1_sh(256) + S_sh(4×256) = 1536 bytes
+// (vs 9728 bytes for V1)
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 16)
+batched_evolution_binary_v2_kernel(
+    const int8_t  *__restrict__ T0_global,
+    const int8_t  *__restrict__ T1_global,
+    const uint8_t *__restrict__ input,
+    const int8_t  *__restrict__ accept_mask,
+    const int8_t  *__restrict__ start_vec,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int block_col_start = blockIdx.x * COLS_PER_BLOCK;
+    int warp_col_start = block_col_start + warp_in_block * TILE;
+
+    extern __shared__ char smem_raw[];
+    int8_t *T0_sh = (int8_t *)smem_raw;
+    int8_t *T1_sh = T0_sh + TILE_ELEMS;
+    int8_t *S_base = T1_sh + TILE_ELEMS;
+    int8_t *S_sh = S_base + warp_in_block * TILE_ELEMS;
+
+    for (int e = threadIdx.x; e < TILE_ELEMS; e += blockDim.x) {
+        T0_sh[e] = T0_global[e];
+        T1_sh[e] = T1_global[e];
+    }
+    for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+        int row = e % TILE;
+        S_sh[e] = start_vec[row];
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> frag_T0, frag_T1;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> frag_S;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> frag_acc0, frag_acc1;
+
+    wmma::load_matrix_sync(frag_T0, T0_sh, TILE);
+    wmma::load_matrix_sync(frag_T1, T1_sh, TILE);
+
+    // Pre-compute per-thread fragment geometry
+    int col_lo = (lane & 3) * 2;       // columns for elements 0-3
+    int col_hi = col_lo + 8;           // columns for elements 4-7
+    int row_lo = lane >> 2;            // row for even-indexed elements
+    int row_hi = row_lo + 8;           // row for odd-pair elements
+
+    for (int t = 0; t < L; t++) {
+        wmma::load_matrix_sync(frag_S, S_sh, TILE);
+
+        wmma::fill_fragment(frag_acc0, 0);
+        wmma::mma_sync(frag_acc0, frag_T0, frag_S, frag_acc0);
+        wmma::fill_fragment(frag_acc1, 0);
+        wmma::mma_sync(frag_acc1, frag_T1, frag_S, frag_acc1);
+
+        // Read input chars: lanes 0-15 each read one column
+        uint8_t my_ch = 2;
+        if (lane < TILE) {
+            int sid = warp_col_start + lane;
+            if (sid < B_padded) my_ch = input[t * B_padded + sid];
+        }
+
+        // Get chars for the 4 columns this thread owns
+        uint8_t ch0 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo);
+        uint8_t ch1 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo + 1);
+        uint8_t ch2 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi);
+        uint8_t ch3 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi + 1);
+
+        // Select from registers, threshold, write directly to S_sh (col-major)
+        // Element layout: i -> (row, col, char_idx)
+        //   0: (row_lo, col_lo,   ch0)    1: (row_lo, col_lo+1, ch1)
+        //   2: (row_hi, col_lo,   ch0)    3: (row_hi, col_lo+1, ch1)
+        //   4: (row_lo, col_hi,   ch2)    5: (row_lo, col_hi+1, ch3)
+        //   6: (row_hi, col_hi,   ch2)    7: (row_hi, col_hi+1, ch3)
+
+        #define REGSEL(EI, COL, ROW, CH) \
+            if ((CH) < 2) { \
+                int32_t v = ((CH) == 0) ? frag_acc0.x[EI] : frag_acc1.x[EI]; \
+                S_sh[(COL) * TILE + (ROW)] = (int8_t)(v > 0 ? 1 : 0); \
+            }
+
+        REGSEL(0, col_lo,     row_lo, ch0)
+        REGSEL(1, col_lo + 1, row_lo, ch1)
+        REGSEL(2, col_lo,     row_hi, ch0)
+        REGSEL(3, col_lo + 1, row_hi, ch1)
+        REGSEL(4, col_hi,     row_lo, ch2)
+        REGSEL(5, col_hi + 1, row_lo, ch3)
+        REGSEL(6, col_hi,     row_hi, ch2)
+        REGSEL(7, col_hi + 1, row_hi, ch3)
+
+        #undef REGSEL
+
+        __syncwarp();
+    }
+
+    for (int col = lane; col < TILE; col += WARP_SIZE) {
+        int string_id = warp_col_start + col;
+        if (string_id >= B) continue;
+        int accepted = 0;
+        for (int r = 0; r < TILE; r++) {
+            if (S_sh[col * TILE + r] > 0 && accept_mask[r] != 0) {
+                accepted = 1;
+                break;
+            }
+        }
+        results[string_id] = accepted;
+    }
+}
+
+
 // ---- General Kernel (|Sigma| > 2) ----------------------------------------
 //
 // Shared memory layout:
@@ -477,6 +598,127 @@ __global__ void multi_accept_check_kernel(
 }
 
 
+// ---- Sparse Block-Diagonal Kernel (|Sigma|=2) ---------------------------
+//
+// Each warp handles one pattern's independent 16x16 diagonal block.
+// Grid: dim3(ceil(B_padded / COLS_PER_BLOCK), P)
+// blockIdx.y selects the pattern.
+//
+// Shared memory layout identical to binary kernel (9728 bytes):
+//   T0_sh[16][16]           256 bytes
+//   T1_sh[16][16]           256 bytes
+//   S_sh[4][16][16]         1024 bytes
+//   acc0_sh[4][16][16]      4096 bytes
+//   acc1_sh[4][16][16]      4096 bytes
+
+__global__ void batched_evolution_sparse_blockdiag_kernel(
+    const int8_t  *__restrict__ T_diag,       // [P, 2, TILE, TILE] = [P * 2 * 256]
+    const uint8_t *__restrict__ input,         // [L, B_padded]
+    const int8_t  *__restrict__ accept_masks,  // [P, TILE] = [P * 16]
+    const int8_t  *__restrict__ start_vecs,    // [P, TILE] = [P * 16]
+    int *__restrict__ results,                 // [P * B]
+    int B, int B_padded, int L, int P
+) {
+    int pattern_id = blockIdx.y;
+    if (pattern_id >= P) return;
+
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int block_col_start = blockIdx.x * COLS_PER_BLOCK;
+    int warp_col_start = block_col_start + warp_in_block * TILE;
+
+    // Shared memory
+    extern __shared__ char smem_raw[];
+    int8_t  *T0_sh  = (int8_t *)smem_raw;                            // 256
+    int8_t  *T1_sh  = T0_sh + TILE_ELEMS;                            // 256
+    int8_t  *S_base = T1_sh + TILE_ELEMS;                            // 4 * 256 = 1024
+    int32_t *acc0_base = (int32_t *)(S_base + WARPS_PER_BLOCK * TILE_ELEMS);  // 4 * 1024 = 4096
+    int32_t *acc1_base = acc0_base + WARPS_PER_BLOCK * TILE_ELEMS;            // 4 * 1024 = 4096
+
+    int8_t  *S_sh   = S_base + warp_in_block * TILE_ELEMS;
+    int32_t *acc0_sh = acc0_base + warp_in_block * TILE_ELEMS;
+    int32_t *acc1_sh = acc1_base + warp_in_block * TILE_ELEMS;
+
+    // Load T0 and T1 from this pattern's diagonal block
+    const int8_t *T_pat = T_diag + pattern_id * 2 * TILE_ELEMS;
+    for (int e = threadIdx.x; e < TILE_ELEMS; e += blockDim.x) {
+        T0_sh[e] = T_pat[e];
+        T1_sh[e] = T_pat[TILE_ELEMS + e];
+    }
+
+    // Initialize S from this pattern's start vector (col-major)
+    const int8_t *sv = start_vecs + pattern_id * TILE;
+    for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+        int row = e % TILE;
+        S_sh[e] = sv[row];
+    }
+    __syncthreads();
+
+    // Fragment declarations
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> frag_T0, frag_T1;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> frag_S;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> frag_acc0, frag_acc1;
+
+    // Load T0 and T1 fragments (they don't change)
+    wmma::load_matrix_sync(frag_T0, T0_sh, TILE);
+    wmma::load_matrix_sync(frag_T1, T1_sh, TILE);
+
+    // Main loop over string positions
+    for (int t = 0; t < L; t++) {
+        // Load S fragment from shared memory (col-major)
+        wmma::load_matrix_sync(frag_S, S_sh, TILE);
+
+        // Compute acc0 = T0 * S and acc1 = T1 * S
+        wmma::fill_fragment(frag_acc0, 0);
+        wmma::mma_sync(frag_acc0, frag_T0, frag_S, frag_acc0);
+
+        wmma::fill_fragment(frag_acc1, 0);
+        wmma::mma_sync(frag_acc1, frag_T1, frag_S, frag_acc1);
+
+        // Store accumulators to shared memory (row-major)
+        wmma::store_matrix_sync(acc0_sh, frag_acc0, TILE, wmma::mem_row_major);
+        wmma::store_matrix_sync(acc1_sh, frag_acc1, TILE, wmma::mem_row_major);
+        __syncwarp();
+
+        // Per-column: select acc0 or acc1 based on input char, threshold, write to S_sh (col-major)
+        for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+            int col = e / TILE;
+            int row = e % TILE;
+            int string_id = warp_col_start + col;
+            uint8_t ch = 2;  // default to identity for out-of-bounds columns
+            if (string_id < B_padded) {
+                ch = input[t * B_padded + string_id];
+            }
+            if (ch < 2) {
+                int32_t val;
+                if (ch == 0)
+                    val = acc0_sh[row * TILE + col];
+                else
+                    val = acc1_sh[row * TILE + col];
+                S_sh[e] = (int8_t)(val > 0 ? 1 : 0);
+            }
+            // else: identity -- S_sh[e] stays unchanged
+        }
+        __syncwarp();
+    }
+
+    // Extract results: write to results[pattern_id * B + string_id]
+    const int8_t *accept_mask = accept_masks + pattern_id * TILE;
+    for (int col = lane; col < TILE; col += WARP_SIZE) {
+        int string_id = warp_col_start + col;
+        if (string_id >= B) continue;
+        int accepted = 0;
+        for (int r = 0; r < TILE; r++) {
+            if (S_sh[col * TILE + r] > 0 && accept_mask[r] != 0) {
+                accepted = 1;
+                break;
+            }
+        }
+        results[pattern_id * B + string_id] = accepted;
+    }
+}
+
+
 // ---- Engine Struct --------------------------------------------------------
 
 struct BatchedEngine {
@@ -507,6 +749,15 @@ struct BatchedEngine {
     cudaEvent_t ev_kern_start, ev_kern_stop;
 
     bool initialized;
+
+    // Sparse block-diagonal mode
+    int8_t  *d_T_diag;            // [P * sigma * TILE * TILE] diagonal blocks
+    int8_t  *d_start_vecs_sp;     // [P * TILE]
+    int8_t  *d_accept_masks_sp;   // [P * TILE]
+    int     *d_results_sp;        // [P * max_B]
+    int      P_sparse;
+    int      sigma_sparse;
+    bool     sparse_initialized;
 
     void init(int n, int sig, const int8_t *trans, const int8_t *accept,
               const int8_t *start_vec, int maxB, int maxL) {
@@ -542,9 +793,28 @@ struct BatchedEngine {
         CHECK_CUDA(cudaEventCreate(&ev_kern_stop));
 
         initialized = true;
+
+        // Initialize sparse fields to safe defaults
+        d_T_diag = nullptr;
+        d_start_vecs_sp = nullptr;
+        d_accept_masks_sp = nullptr;
+        d_results_sp = nullptr;
+        P_sparse = 0;
+        sigma_sparse = 0;
+        sparse_initialized = false;
+    }
+
+    void destroy_sparse() {
+        if (!sparse_initialized) return;
+        if (d_T_diag) { cudaFree(d_T_diag); d_T_diag = nullptr; }
+        if (d_start_vecs_sp) { cudaFree(d_start_vecs_sp); d_start_vecs_sp = nullptr; }
+        if (d_accept_masks_sp) { cudaFree(d_accept_masks_sp); d_accept_masks_sp = nullptr; }
+        if (d_results_sp) { cudaFree(d_results_sp); d_results_sp = nullptr; }
+        sparse_initialized = false;
     }
 
     void destroy() {
+        destroy_sparse();
         if (!initialized) return;
         delete[] h_accept_mask;
         delete[] h_trans_matrices;
@@ -560,6 +830,127 @@ struct BatchedEngine {
         cudaEventDestroy(ev_kern_start);
         cudaEventDestroy(ev_kern_stop);
         initialized = false;
+    }
+
+    void init_sparse(int P, int sig, const int8_t *T_diag,
+                     const int8_t *start_vecs, const int8_t *accept_masks,
+                     int maxB, int maxL) {
+        destroy_sparse();
+        P_sparse = P;
+        sigma_sparse = sig;
+
+        // Allocate and copy diagonal blocks: [P * sigma * TILE * TILE]
+        size_t T_bytes = (size_t)P * sig * TILE_ELEMS;
+        CHECK_CUDA(cudaMalloc(&d_T_diag, T_bytes));
+        CHECK_CUDA(cudaMemcpy(d_T_diag, T_diag, T_bytes, cudaMemcpyHostToDevice));
+
+        // Allocate and copy start vectors: [P * TILE]
+        size_t sv_bytes = (size_t)P * TILE;
+        CHECK_CUDA(cudaMalloc(&d_start_vecs_sp, sv_bytes));
+        CHECK_CUDA(cudaMemcpy(d_start_vecs_sp, start_vecs, sv_bytes, cudaMemcpyHostToDevice));
+
+        // Allocate and copy accept masks: [P * TILE]
+        size_t am_bytes = (size_t)P * TILE;
+        CHECK_CUDA(cudaMalloc(&d_accept_masks_sp, am_bytes));
+        CHECK_CUDA(cudaMemcpy(d_accept_masks_sp, accept_masks, am_bytes, cudaMemcpyHostToDevice));
+
+        // Allocate results: [P * maxB]
+        CHECK_CUDA(cudaMalloc(&d_results_sp, (size_t)P * maxB * sizeof(int)));
+
+        // Ensure d_input is allocated (reuse from main init, or allocate here)
+        if (!initialized) {
+            max_B = maxB;
+            max_L = maxL;
+            B_padded_max = ((maxB + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+            CHECK_CUDA(cudaMalloc(&d_input, (size_t)maxL * B_padded_max));
+            CHECK_CUDA(cudaEventCreate(&ev_start));
+            CHECK_CUDA(cudaEventCreate(&ev_stop));
+            CHECK_CUDA(cudaEventCreate(&ev_kern_start));
+            CHECK_CUDA(cudaEventCreate(&ev_kern_stop));
+        } else {
+            // Main engine already initialized -- ensure input buffer is large enough
+            int new_B_padded_max = ((maxB + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+            size_t needed = (size_t)maxL * new_B_padded_max;
+            size_t existing = (size_t)max_L * B_padded_max;
+            if (needed > existing) {
+                cudaFree(d_input);
+                CHECK_CUDA(cudaMalloc(&d_input, needed));
+                if (maxB > max_B) max_B = maxB;
+                if (maxL > max_L) max_L = maxL;
+                B_padded_max = new_B_padded_max;
+            }
+        }
+
+        sparse_initialized = true;
+    }
+
+    int dispatch_sparse(const uint8_t *h_input, int B, int L, int B_padded,
+                        int *h_results, float *kernel_ms, float *total_ms) {
+        if (!sparse_initialized) return -1;
+        if (sigma_sparse != 2) return -2;  // sparse kernel supports sigma=2 only
+
+        CHECK_CUDA(cudaEventRecord(ev_start));
+
+        // H2D: copy input
+        size_t input_bytes = (size_t)L * B_padded;
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
+
+        CHECK_CUDA(cudaEventRecord(ev_kern_start));
+
+        // Launch sparse block-diagonal kernel with 2D grid
+        int blocks_x = (B_padded + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK;
+        dim3 grid(blocks_x, P_sparse);
+        int smem = 2 * TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS
+                   + 2 * WARPS_PER_BLOCK * TILE_ELEMS * (int)sizeof(int32_t);
+        batched_evolution_sparse_blockdiag_kernel<<<grid, BLOCK_SIZE, smem>>>(
+            d_T_diag, d_input, d_accept_masks_sp, d_start_vecs_sp,
+            d_results_sp, B, B_padded, L, P_sparse);
+        CHECK_CUDA(cudaGetLastError());
+
+        CHECK_CUDA(cudaEventRecord(ev_kern_stop));
+
+        // D2H: results [P_sparse * B]
+        CHECK_CUDA(cudaMemcpy(h_results, d_results_sp,
+                              (size_t)P_sparse * B * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+
+        CHECK_CUDA(cudaEventRecord(ev_stop));
+        CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
+        if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
+
+        return 0;
+    }
+
+    int dispatch_v2(const uint8_t *h_input, int B, int L, int B_padded,
+                    int *h_results, float *kernel_ms, float *total_ms) {
+        if (!initialized) return -1;
+        if (sigma != 2 || N > TILE) return -2;
+
+        CHECK_CUDA(cudaEventRecord(ev_start));
+        size_t input_bytes = (size_t)L * B_padded;
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
+
+        CHECK_CUDA(cudaEventRecord(ev_kern_start));
+
+        int n_blocks = B_padded / COLS_PER_BLOCK;
+        int smem = 2 * TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS;
+        batched_evolution_binary_v2_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+            d_trans, d_trans + TILE_ELEMS,
+            d_input, d_accept, d_start_vec,
+            B, B_padded, L, d_results);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(ev_kern_stop));
+
+        CHECK_CUDA(cudaMemcpy(h_results, d_results, (size_t)B * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaEventRecord(ev_stop));
+        CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
+        if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
+        return 0;
     }
 
     // Dispatch: input is [L][B_padded] position-contiguous, already on host
@@ -698,7 +1089,7 @@ struct BatchedEngine {
 
 // ---- Global Engine (C API pattern) ----------------------------------------
 
-static BatchedEngine g_engine = {.initialized = false};
+static BatchedEngine g_engine = {};
 
 
 // ---- C API ----------------------------------------------------------------
@@ -736,6 +1127,14 @@ int batched_engine_dispatch(const uint8_t *input,  // [L, B_padded]
                             float *kernel_ms, float *total_ms) {
     int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
     return g_engine.dispatch(input, B, L, B_padded, results, kernel_ms, total_ms);
+}
+
+int batched_engine_dispatch_v2(const uint8_t *input,
+                               int B, int L,
+                               int *results,
+                               float *kernel_ms, float *total_ms) {
+    int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+    return g_engine.dispatch_v2(input, B, L, B_padded, results, kernel_ms, total_ms);
 }
 
 int batched_engine_dispatch_multi(
@@ -776,6 +1175,22 @@ void batched_prepare_input(
         }
         // Positions beyond string length: already set to identity_idx by memset
     }
+}
+
+int batched_engine_init_sparse(int P, int sigma,
+                               const int8_t *T_diag,
+                               const int8_t *start_vecs,
+                               const int8_t *accept_masks,
+                               int max_B, int max_L) {
+    g_engine.init_sparse(P, sigma, T_diag, start_vecs, accept_masks, max_B, max_L);
+    return 0;
+}
+
+int batched_engine_dispatch_sparse(const uint8_t *input, int B, int L,
+                                   int *results,
+                                   float *kernel_ms, float *total_ms) {
+    int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+    return g_engine.dispatch_sparse(input, B, L, B_padded, results, kernel_ms, total_ms);
 }
 
 }  // extern "C"
@@ -1128,19 +1543,20 @@ static void test_prepare_input() {
 
 
 static void bench_throughput() {
-    printf("\n=== Throughput Benchmark (binary kernel) ===\n");
+    printf("\n=== Throughput Benchmark: V1 vs V2 (binary kernel) ===\n");
     EvenADFA dfa;
     int8_t start_vec[TILE];
     memset(start_vec, 0, TILE);
     start_vec[0] = 1;
 
-    int batch_sizes[] = {64, 256, 1024, 4096, 16384, 65536};
-    int lengths[]     = {32, 128, 512, 2048};
-    int n_batches = 6, n_lengths = 4;
+    int batch_sizes[] = {1024, 4096, 16384, 65536, 262144};
+    int lengths[]     = {128, 512, 2048};
+    int n_batches = 5, n_lengths = 3;
     int identity_idx = 2;
 
-    printf("  %8s  %8s  %12s  %12s  %12s  %12s\n",
-           "B", "L", "kern(ms)", "total(ms)", "kern Gch/s", "total Gch/s");
+    printf("  %8s  %8s  |  %10s  %10s  |  %10s  %10s  | speedup\n",
+           "B", "L", "V1 kern ms", "V1 Gc/s", "V2 kern ms", "V2 Gc/s");
+    printf("  %s\n", "--------------------------------------------------------------------------");
 
     for (int bi = 0; bi < n_batches; bi++) {
         for (int li = 0; li < n_lengths; li++) {
@@ -1151,7 +1567,6 @@ static void bench_throughput() {
             BatchedEngine eng;
             eng.init(TILE, 2, dfa.trans, dfa.accept, start_vec, B_padded, L);
 
-            // Generate random input
             srand(42);
             size_t input_size = (size_t)L * B_padded;
             uint8_t *input = new uint8_t[input_size];
@@ -1162,27 +1577,32 @@ static void bench_throughput() {
 
             int *results = new int[B];
 
-            // Warmup
-            for (int w = 0; w < 3; w++)
+            // Warmup both
+            for (int w = 0; w < 3; w++) {
                 eng.dispatch(input, B, L, B_padded, results, nullptr, nullptr);
-
-            // Measure
-            int iters = 20;
-            float kern_total = 0, total_total = 0;
-            for (int it = 0; it < iters; it++) {
-                float km, tm;
-                eng.dispatch(input, B, L, B_padded, results, &km, &tm);
-                kern_total += km;
-                total_total += tm;
+                eng.dispatch_v2(input, B, L, B_padded, results, nullptr, nullptr);
             }
-            float kern_ms = kern_total / iters;
-            float tot_ms = total_total / iters;
-            double chars = (double)B * L;
-            double kern_gchs = chars / (kern_ms * 1e6);
-            double total_gchs = chars / (tot_ms * 1e6);
 
-            printf("  %8d  %8d  %12.4f  %12.4f  %12.3f  %12.3f\n",
-                   B, L, kern_ms, tot_ms, kern_gchs, total_gchs);
+            int iters = 20;
+            float v1_kern = 0, v2_kern = 0;
+            for (int it = 0; it < iters; it++) {
+                float km;
+                eng.dispatch(input, B, L, B_padded, results, &km, nullptr);
+                v1_kern += km;
+            }
+            for (int it = 0; it < iters; it++) {
+                float km;
+                eng.dispatch_v2(input, B, L, B_padded, results, &km, nullptr);
+                v2_kern += km;
+            }
+            v1_kern /= iters;
+            v2_kern /= iters;
+            double chars = (double)B * L;
+            double v1_gchs = chars / (v1_kern * 1e6);
+            double v2_gchs = chars / (v2_kern * 1e6);
+
+            printf("  %8d  %8d  |  %10.4f  %10.3f  |  %10.4f  %10.3f  |  %.2fx\n",
+                   B, L, v1_kern, v1_gchs, v2_kern, v2_gchs, v1_kern / v2_kern);
 
             delete[] input;
             delete[] results;
@@ -1213,6 +1633,46 @@ int main() {
     test_large_batch_binary();
     test_general_kernel();
     test_prepare_input();
+
+    // V2 correctness: compare against V1 on large random batch
+    {
+        printf("\n--- test_v2_correctness (V2 vs V1 cross-validate) ---\n");
+        EvenADFA dfa;
+        int8_t sv[TILE];
+        memset(sv, 0, TILE);
+        sv[0] = 1;
+
+        int B = 4096, L = 256;
+        int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+        int identity_idx = 2;
+
+        BatchedEngine eng;
+        eng.init(TILE, 2, dfa.trans, dfa.accept, sv, B_padded, L);
+
+        srand(77);
+        size_t input_size = (size_t)L * B_padded;
+        uint8_t *inp = new uint8_t[input_size];
+        memset(inp, (uint8_t)identity_idx, input_size);
+        for (int b = 0; b < B; b++)
+            for (int t = 0; t < L; t++)
+                inp[t * B_padded + b] = rand() % 2;
+
+        int *res_v1 = new int[B], *res_v2 = new int[B];
+        float km;
+        eng.dispatch(inp, B, L, B_padded, res_v1, &km, nullptr);
+        eng.dispatch_v2(inp, B, L, B_padded, res_v2, &km, nullptr);
+
+        int mismatches = 0;
+        for (int b = 0; b < B; b++)
+            if (res_v1[b] != res_v2[b]) mismatches++;
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "V2 vs V1 B=%d L=%d (%d mismatches)", B, L, mismatches);
+        check(msg, mismatches == 0);
+
+        delete[] inp; delete[] res_v1; delete[] res_v2;
+        eng.destroy();
+    }
 
     printf("\n=== Results: %d / %d passed ===\n", g_pass, g_tests);
     if (g_pass != g_tests) {

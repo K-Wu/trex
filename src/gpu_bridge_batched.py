@@ -37,9 +37,11 @@ class BatchedEvolutionEngine:
                  max_B: int = 65536, max_L: int = 4096,
                  start_vec=None, accept_mask=None,
                  trans_matrices=None, N=None, sigma=None,
-                 char_to_idx=None, alphabet=None):
+                 char_to_idx=None, alphabet=None,
+                 regsel: bool = False):
         self.lib = lib
         self.dm = dm
+        self.regsel = regsel
 
         if N is not None:
             _N = N
@@ -144,7 +146,10 @@ class BatchedEvolutionEngine:
         kern_ms = ctypes.c_float(0)
         total_ms = ctypes.c_float(0)
 
-        rc = self.lib.batched_engine_dispatch(
+        dispatch_fn = (self.lib.batched_engine_dispatch_v2
+                       if self.regsel
+                       else self.lib.batched_engine_dispatch)
+        rc = dispatch_fn(
             input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             B,
             L_max,
@@ -176,7 +181,10 @@ class BatchedEvolutionEngine:
         kern_ms = ctypes.c_float(0)
         total_ms = ctypes.c_float(0)
 
-        rc = self.lib.batched_engine_dispatch(
+        dispatch_fn = (self.lib.batched_engine_dispatch_v2
+                       if self.regsel
+                       else self.lib.batched_engine_dispatch)
+        rc = dispatch_fn(
             input_data.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             B,
             L_max,
@@ -222,6 +230,15 @@ class BatchedGPUSimulator:
             ctypes.POINTER(ctypes.c_float),   # total_ms
         ]
 
+        self.lib.batched_engine_dispatch_v2.restype = ctypes.c_int
+        self.lib.batched_engine_dispatch_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+
         self.lib.batched_engine_device_check.restype = ctypes.c_int
         self.lib.batched_engine_device_check.argtypes = []
 
@@ -245,12 +262,14 @@ class BatchedGPUSimulator:
 
     def create_engine(self, dm: DFAMatrices,
                       max_B: int = 65536,
-                      max_L: int = 4096) -> BatchedEvolutionEngine:
-        return BatchedEvolutionEngine(self.lib, dm, max_B, max_L)
+                      max_L: int = 4096,
+                      regsel: bool = False) -> BatchedEvolutionEngine:
+        return BatchedEvolutionEngine(self.lib, dm, max_B, max_L, regsel=regsel)
 
     def create_packed_engine(self, packed_engine,
                              max_B: int = 65536,
-                             max_L: int = 4096) -> BatchedEvolutionEngine:
+                             max_L: int = 4096,
+                             regsel: bool = False) -> BatchedEvolutionEngine:
         pe = packed_engine
         return BatchedEvolutionEngine(
             self.lib, None,
@@ -261,4 +280,5 @@ class BatchedGPUSimulator:
             N=pe._NP,
             sigma=len(pe._unified_alphabet),
             char_to_idx=pe._unified_char_to_idx,
+            regsel=regsel,
         )
