@@ -286,6 +286,141 @@ nfa_tc_binary_v3_kernel(
 }
 
 
+// ---- Bit-parallel Pre-composition (host-side, for V4) --------------------
+//
+// For K=4, σ=2: pre-compose T_{c3} × T_{c2} × T_{c1} × T_{c0} for all 16
+// possible 4-bit character patterns.  Each 64×64 Boolean matrix is stored as
+// 64 × uint64_t (one bitmask per row).  Total table: 16 × 512B = 8 KB.
+
+constexpr int CHUNK_K = 4;
+constexpr int N_PATTERNS_V4 = 1 << CHUNK_K;  // 16
+constexpr int THREADS_V4 = 128;
+
+static void compose_bitpar_host(const uint64_t *A, const uint64_t *B_rows,
+                                 uint64_t *C) {
+    for (int i = 0; i < N; i++) {
+        uint64_t row = 0;
+        uint64_t a = A[i];
+        while (a) {
+            int k = __builtin_ctzll(a);
+            row |= B_rows[k];
+            a &= a - 1;
+        }
+        C[i] = row;
+    }
+}
+
+static void float_to_bitpar(const float *T_float, int sigma, uint64_t *T_bits) {
+    for (int c = 0; c < sigma; c++) {
+        for (int i = 0; i < N; i++) {
+            uint64_t row = 0;
+            for (int j = 0; j < N; j++) {
+                if (T_float[c * N * N + i * N + j] > 0.5f)
+                    row |= (1ULL << j);
+            }
+            T_bits[c * N + i] = row;
+        }
+    }
+}
+
+static void build_precomposed_table(const uint64_t *T_bits, uint64_t *table) {
+    // table layout: table[row * N_PATTERNS + pattern]
+    // M_p = T_{c_{K-1}} × ... × T_{c_1} × T_{c_0}
+    for (int p = 0; p < N_PATTERNS_V4; p++) {
+        uint64_t M[N];
+        int c0 = p & 1;
+        memcpy(M, &T_bits[c0 * N], N * sizeof(uint64_t));
+
+        for (int k = 1; k < CHUNK_K; k++) {
+            int ck = (p >> k) & 1;
+            uint64_t tmp[N];
+            compose_bitpar_host(&T_bits[ck * N], M, tmp);
+            memcpy(M, tmp, N * sizeof(uint64_t));
+        }
+
+        for (int i = 0; i < N; i++)
+            table[i * N_PATTERNS_V4 + p] = M[i];
+    }
+}
+
+
+// ---- V4: Bit-parallel Chunked Kernel (CUDA cores, no TC) -----------------
+//
+// Pre-composed transition matrices for K=4 character chunks.
+// Each thread handles ONE string.  State = uint64_t bitmask (N=64).
+// Inner loop: L/4 iterations — lookup composed matrix by 4-bit pattern,
+// bit-parallel Boolean matmul (64 AND+test+OR ops per chunk).
+//
+// Uses CUDA INT cores exclusively — tensor cores are idle.  Much higher
+// occupancy than TC kernels (~25 blocks/SM vs ~2), better latency hiding.
+//
+// Smem: M_table[64][16] = 8192B + T_bits[2][64] = 1024B = 9216B total
+
+__global__ void __launch_bounds__(THREADS_V4, 16)
+nfa_bitpar_v4_kernel(
+    const uint64_t *__restrict__ M_table_global,
+    const uint64_t *__restrict__ T_bits_global,
+    const uint8_t  *__restrict__ input,
+    uint64_t accept_bits,
+    uint64_t start_bits,
+    const int *__restrict__ lengths,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    extern __shared__ char smem_v4[];
+    uint64_t *M_sh = (uint64_t *)smem_v4;
+    uint64_t *T_sh = M_sh + N * N_PATTERNS_V4;
+
+    int n_load = N * N_PATTERNS_V4 + 2 * N;
+    for (int e = threadIdx.x; e < n_load; e += blockDim.x)
+        ((uint64_t *)smem_v4)[e] = (e < N * N_PATTERNS_V4)
+            ? M_table_global[e] : T_bits_global[e - N * N_PATTERNS_V4];
+    __syncthreads();
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= B_padded) return;
+
+    uint64_t state = (tid < B) ? start_bits : 0;
+    int my_len = (tid < B) ? lengths[tid] : 0;
+
+    int n_chunks = my_len / CHUNK_K;
+    int leftover_start = n_chunks * CHUNK_K;
+
+    for (int c = 0; c < n_chunks; c++) {
+        int base_t = c * CHUNK_K;
+        uint8_t c0 = input[(base_t    ) * B_padded + tid];
+        uint8_t c1 = input[(base_t + 1) * B_padded + tid];
+        uint8_t c2 = input[(base_t + 2) * B_padded + tid];
+        uint8_t c3 = input[(base_t + 3) * B_padded + tid];
+        int pattern = (c0 & 1) | ((c1 & 1) << 1)
+                    | ((c2 & 1) << 2) | ((c3 & 1) << 3);
+
+        uint64_t ns = 0;
+        #pragma unroll
+        for (int i = 0; i < N; i++) {
+            uint64_t row = M_sh[i * N_PATTERNS_V4 + pattern];
+            if (row & state) ns |= (1ULL << i);
+        }
+        state = ns;
+    }
+
+    for (int t = leftover_start; t < my_len; t++) {
+        uint8_t ch = input[t * B_padded + tid];
+        if (ch >= 2) continue;
+        const uint64_t *T_ch = T_sh + ch * N;
+        uint64_t ns = 0;
+        #pragma unroll
+        for (int i = 0; i < N; i++) {
+            if (T_ch[i] & state) ns |= (1ULL << i);
+        }
+        state = ns;
+    }
+
+    if (tid < B)
+        results[tid] = (state & accept_bits) ? 1 : 0;
+}
+
+
 // ---- Engine Struct --------------------------------------------------------
 
 struct NFATCEngine {
@@ -301,6 +436,13 @@ struct NFATCEngine {
     half    *d_start_vec;
     uint8_t *d_input;
     int     *d_results;
+
+    // V4 bit-parallel data
+    uint64_t *d_M_table;
+    uint64_t *d_T_bits;
+    int      *d_lengths;
+    uint64_t accept_bits;
+    uint64_t start_bits;
 
     cudaEvent_t ev_start, ev_stop, ev_kern_start, ev_kern_stop;
     bool initialized;
@@ -342,6 +484,29 @@ struct NFATCEngine {
         CHECK_CUDA(cudaEventCreate(&ev_kern_start));
         CHECK_CUDA(cudaEventCreate(&ev_kern_stop));
 
+        // V4 bit-parallel pre-composition
+        std::vector<uint64_t> h_T_bits(sig * N);
+        float_to_bitpar(T_matrices, sig, h_T_bits.data());
+
+        accept_bits = 0;
+        start_bits = 0;
+        for (int i = 0; i < n; i++) {
+            if (accept_mask[i] > 0.5f) accept_bits |= (1ULL << i);
+            if (start_vec[i] > 0.5f) start_bits |= (1ULL << i);
+        }
+
+        std::vector<uint64_t> h_M_table(N * N_PATTERNS_V4);
+        build_precomposed_table(h_T_bits.data(), h_M_table.data());
+
+        CHECK_CUDA(cudaMalloc(&d_M_table, N * N_PATTERNS_V4 * sizeof(uint64_t)));
+        CHECK_CUDA(cudaMalloc(&d_T_bits, sig * N * sizeof(uint64_t)));
+        CHECK_CUDA(cudaMalloc(&d_lengths, (size_t)B_padded_max * sizeof(int)));
+
+        CHECK_CUDA(cudaMemcpy(d_M_table, h_M_table.data(),
+                              N * N_PATTERNS_V4 * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_T_bits, h_T_bits.data(),
+                              sig * N * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
         initialized = true;
     }
 
@@ -352,6 +517,9 @@ struct NFATCEngine {
         cudaFree(d_start_vec);
         cudaFree(d_input);
         cudaFree(d_results);
+        cudaFree(d_M_table);
+        cudaFree(d_T_bits);
+        cudaFree(d_lengths);
         cudaEventDestroy(ev_start);
         cudaEventDestroy(ev_stop);
         cudaEventDestroy(ev_kern_start);
@@ -360,7 +528,8 @@ struct NFATCEngine {
     }
 
     int dispatch(const uint8_t *h_input, int B, int L_val, int B_padded,
-                 int *h_results, float *kernel_ms, float *total_ms) {
+                 int *h_results, float *kernel_ms, float *total_ms,
+                 const int *h_lengths = nullptr) {
         if (!initialized) return -1;
         if (sigma != 2 || n_states != N) return -2;
 
@@ -369,21 +538,43 @@ struct NFATCEngine {
         size_t input_bytes = (size_t)L_val * B_padded;
         CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
 
+        if (kernel_variant == 4) {
+            if (h_lengths) {
+                CHECK_CUDA(cudaMemcpy(d_lengths, h_lengths,
+                                      B * sizeof(int), cudaMemcpyHostToDevice));
+            } else {
+                std::vector<int> tmp_len(B, L_val);
+                CHECK_CUDA(cudaMemcpy(d_lengths, tmp_len.data(),
+                                      B * sizeof(int), cudaMemcpyHostToDevice));
+            }
+            if (B < B_padded)
+                CHECK_CUDA(cudaMemset(d_lengths + B, 0,
+                                      (B_padded - B) * sizeof(int)));
+        }
+
         CHECK_CUDA(cudaEventRecord(ev_kern_start));
 
-        int n_blocks = B_padded / COLS_PER_BLOCK;
-        int smem = (2 * N_ELEMS + WARPS_PER_BLOCK * N * TILE) * (int)sizeof(half);
-
-        if (kernel_variant == 3) {
-            nfa_tc_binary_v3_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
-                d_T, d_T + N_ELEMS,
-                d_input, d_accept, d_start_vec,
-                B, B_padded, L_val, d_results);
+        if (kernel_variant == 4) {
+            int n_blocks_v4 = (B_padded + THREADS_V4 - 1) / THREADS_V4;
+            int smem_v4 = (N * N_PATTERNS_V4 + 2 * N) * (int)sizeof(uint64_t);
+            nfa_bitpar_v4_kernel<<<n_blocks_v4, THREADS_V4, smem_v4>>>(
+                d_M_table, d_T_bits, d_input,
+                accept_bits, start_bits,
+                d_lengths, B, B_padded, L_val, d_results);
         } else {
-            nfa_tc_binary_v2_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
-                d_T, d_T + N_ELEMS,
-                d_input, d_accept, d_start_vec,
-                B, B_padded, L_val, d_results);
+            int n_blocks = B_padded / COLS_PER_BLOCK;
+            int smem = (2 * N_ELEMS + WARPS_PER_BLOCK * N * TILE) * (int)sizeof(half);
+            if (kernel_variant == 3) {
+                nfa_tc_binary_v3_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                    d_T, d_T + N_ELEMS,
+                    d_input, d_accept, d_start_vec,
+                    B, B_padded, L_val, d_results);
+            } else {
+                nfa_tc_binary_v2_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                    d_T, d_T + N_ELEMS,
+                    d_input, d_accept, d_start_vec,
+                    B, B_padded, L_val, d_results);
+            }
         }
         CHECK_CUDA(cudaGetLastError());
 
@@ -458,17 +649,22 @@ int nfa_tc_engine_dispatch(
     int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
     int identity_idx = g_nfa_engine.sigma;
 
+    std::vector<int> lengths(B);
+    for (int i = 0; i < B; i++)
+        lengths[i] = offsets[i + 1] - offsets[i];
+
     size_t input_size = (size_t)L * B_padded;
     std::vector<uint8_t> input(input_size, (uint8_t)identity_idx);
     for (int b = 0; b < B; b++) {
         int str_start = offsets[b];
-        int str_len = offsets[b + 1] - str_start;
+        int str_len = lengths[b];
         for (int t = 0; t < str_len && t < L; t++)
             input[t * B_padded + b] = raw_concat[str_start + t];
     }
 
     return g_nfa_engine.dispatch(input.data(), B, L, B_padded,
-                                  results, kernel_ms, total_ms);
+                                  results, kernel_ms, total_ms,
+                                  lengths.data());
 }
 
 void nfa_tc_engine_destroy(void) {
@@ -727,9 +923,12 @@ static void bench_throughput() {
     int lengths[]     = {128, 512, 2048};
     int n_batches = 5, n_lengths = 3;
 
-    for (int variant = 2; variant <= 3; variant++) {
-        printf("\n=== NFA TC N=64 V%d Throughput Benchmark (binary) ===\n", variant);
-        printf("  %8s  %6s  |  %8s  %8s  %8s\n", "B", "L", "Gc/s", "TFLOPS", "kern_ms");
+    for (int variant = 2; variant <= 4; variant++) {
+        const char *label = (variant <= 3) ? "TC" : "BitPar";
+        printf("\n=== NFA N=64 V%d (%s) Throughput Benchmark (binary) ===\n",
+               variant, label);
+        printf("  %8s  %6s  |  %8s  %8s  %8s\n", "B", "L", "Gc/s",
+               (variant <= 3) ? "TFLOPS" : "eq.TFLOP", "kern_ms");
         printf("  %s\n", "---------------------------------------------------");
 
         for (int bi = 0; bi < n_batches; bi++) {
@@ -830,6 +1029,80 @@ int main() {
         char msg[128];
         snprintf(msg, sizeof(msg), "v2_v3_cross B=%d L=%d (%d mismatches)", B2, L2, mm);
         check(msg, mm == 0);
+        nfa_tc_engine_destroy();
+    }
+
+    // V3 vs V4 cross-validation
+    {
+        printf("\n--- test_v3_v4_cross (4096 x 256, random NFA) ---\n");
+        float tr4[2 * N_ELEMS], ac4[N], sv4[N];
+        memset(tr4, 0, sizeof(tr4)); memset(ac4, 0, sizeof(ac4)); memset(sv4, 0, sizeof(sv4));
+        sv4[0] = 1.0f;
+        srand(55);
+        for (int s = 0; s < N; s++) if (rand() % 4 == 0) ac4[s] = 1.0f;
+        for (int c = 0; c < 2; c++) {
+            float *T = tr4 + c * N_ELEMS;
+            for (int src = 0; src < N; src++)
+                for (int ns = 0; ns < 1 + rand() % 3; ns++)
+                    T[(rand() % N) * N + src] = 1.0f;
+        }
+        int B4 = 4096, L4 = 256;
+        int B4_p = ((B4 + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+        srand(66);
+        size_t isz4 = (size_t)L4 * B4_p;
+        std::vector<uint8_t> inp4(isz4, 2);
+        for (int b = 0; b < B4; b++)
+            for (int t = 0; t < L4; t++)
+                inp4[t * B4_p + b] = rand() % 2;
+        std::vector<int> r3x(B4), r4x(B4);
+        nfa_tc_engine_init(tr4, ac4, sv4, N, 2, B4_p, L4);
+        g_nfa_engine.kernel_variant = 3;
+        g_nfa_engine.dispatch(inp4.data(), B4, L4, B4_p, r3x.data(), nullptr, nullptr);
+        g_nfa_engine.kernel_variant = 4;
+        g_nfa_engine.dispatch(inp4.data(), B4, L4, B4_p, r4x.data(), nullptr, nullptr);
+        int mm4 = 0;
+        for (int b = 0; b < B4; b++) if (r3x[b] != r4x[b]) mm4++;
+        char msg4[128];
+        snprintf(msg4, sizeof(msg4), "v3_v4_cross B=%d L=%d (%d mismatches)", B4, L4, mm4);
+        check(msg4, mm4 == 0);
+        nfa_tc_engine_destroy();
+    }
+
+    // V4 basic test (uses C API path with per-string lengths)
+    {
+        printf("\n--- test_v4_basic (>=3 a's NFA via V4) ---\n");
+        float trans[2 * N_ELEMS], accept[N], start_vec[N];
+        build_nfa_3a(trans, accept, start_vec);
+
+        nfa_tc_engine_init(trans, accept, start_vec, N, 2, 64, 256);
+        g_nfa_engine.kernel_variant = 4;
+
+        uint8_t all_chars[] = {
+            0,                // "a"
+            0, 0,             // "aa"
+            0, 0, 0,          // "aaa"
+            1,                // "b"
+            1, 0, 1,          // "bab"
+            0, 0, 0, 1,       // "aaab"
+            1, 0, 0, 0,       // "baaa"
+            0, 1, 0, 1,       // "abab"
+            0, 0, 1, 0, 0     // "aabaa"
+        };
+        int offsets[] = {0, 0, 1, 3, 6, 7, 10, 14, 18, 22, 27};
+        bool expected[] = {
+            false, false, false, true, false, false, true, true, false, true
+        };
+        int B = 10;
+
+        int results[10];
+        float km, tm;
+        nfa_tc_engine_dispatch(all_chars, offsets, results, B, 27, &km, &tm);
+
+        int v4_ok = 1;
+        for (int i = 0; i < B; i++)
+            if (results[i] != (expected[i] ? 1 : 0)) v4_ok = 0;
+        check("v4_basic (>=3 a's)", v4_ok == 1);
+
         nfa_tc_engine_destroy();
     }
 
