@@ -5,9 +5,14 @@
  * Maintains a state matrix S[N][B] where each column is a DFA state vector.
  * At each string position, applies transition matrices via WMMA 16x16 int8 MMA.
  *
- * Two kernel variants:
- *   Binary (|Sigma|=2): Two independent MMAs per step, select by input char
- *   General (|Sigma|>2): Per-character iteration with ballot-based skip
+ * Binary kernel variants (|Sigma|=2):
+ *   V1: store_matrix_sync → shared memory → select → S_sh
+ *   V2: register-level select via probed acc layout (112 Gc/s, 32 regs)
+ *   V3: V2 + relaxed launch_bounds (116 Gc/s, 40 regs) ← fastest
+ *   V4: register pipeline — acc→matb shuffle, no S_sh in inner loop (80 Gc/s)
+ *   V5: V4 + relaxed launch_bounds (82 Gc/s, 48 regs)
+ *
+ * General (|Sigma|>2): Per-character iteration with ballot-based skip
  *
  * Threading model:
  *   Each warp handles 16 consecutive columns (strings) -- one WMMA 16x16 tile
@@ -291,6 +296,276 @@ batched_evolution_binary_v2_kernel(
         }
         results[string_id] = accepted;
     }
+}
+
+
+// ---- V3: Higher Occupancy (V2 body, relaxed launch_bounds) ----------------
+// ---- V4: Register Pipeline (no S_sh in inner loop, acc→matb shuffles) -----
+// ---- V5: Register Pipeline + Higher Occupancy -----------------------------
+//
+// Fragment layouts (probed on H200, SM 9.0):
+//   acc:  row = lane/4 + ((i>>1)&1)*8,  col = (lane%4)*2 + (i&1) + (i>>2)*8
+//   matb: row = (lane%4)*4 + (i%4),     col = lane/4 + (i/4)*8
+//
+// acc→matb shuffle mapping (for matrix position (row, col)):
+//   src_lane = (dst_row & 7) * 4 + (lane >> 3)
+//   src_i    = ((lane >> 2) & 1) | ((dst_row >= 8) << 1) | ((i >= 4) << 2)
+
+__forceinline__ __device__ void binary_v2_body(
+    const int8_t *T0_global, const int8_t *T1_global,
+    const uint8_t *input, const int8_t *accept_mask,
+    const int8_t *start_vec, int B, int B_padded, int L,
+    int *results)
+{
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int block_col_start = blockIdx.x * COLS_PER_BLOCK;
+    int warp_col_start = block_col_start + warp_in_block * TILE;
+
+    extern __shared__ char smem_raw[];
+    int8_t *T0_sh = (int8_t *)smem_raw;
+    int8_t *T1_sh = T0_sh + TILE_ELEMS;
+    int8_t *S_base = T1_sh + TILE_ELEMS;
+    int8_t *S_sh = S_base + warp_in_block * TILE_ELEMS;
+
+    for (int e = threadIdx.x; e < TILE_ELEMS; e += blockDim.x) {
+        T0_sh[e] = T0_global[e];
+        T1_sh[e] = T1_global[e];
+    }
+    for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+        S_sh[e] = start_vec[e % TILE];
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> frag_T0, frag_T1;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> frag_S;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> frag_acc0, frag_acc1;
+
+    wmma::load_matrix_sync(frag_T0, T0_sh, TILE);
+    wmma::load_matrix_sync(frag_T1, T1_sh, TILE);
+
+    int col_lo = (lane & 3) * 2;
+    int col_hi = col_lo + 8;
+    int row_lo = lane >> 2;
+    int row_hi = row_lo + 8;
+
+    for (int t = 0; t < L; t++) {
+        wmma::load_matrix_sync(frag_S, S_sh, TILE);
+
+        wmma::fill_fragment(frag_acc0, 0);
+        wmma::mma_sync(frag_acc0, frag_T0, frag_S, frag_acc0);
+        wmma::fill_fragment(frag_acc1, 0);
+        wmma::mma_sync(frag_acc1, frag_T1, frag_S, frag_acc1);
+
+        uint8_t my_ch = 2;
+        if (lane < TILE) {
+            int sid = warp_col_start + lane;
+            if (sid < B_padded) my_ch = input[t * B_padded + sid];
+        }
+
+        uint8_t ch0 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo);
+        uint8_t ch1 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo + 1);
+        uint8_t ch2 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi);
+        uint8_t ch3 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi + 1);
+
+        #define REGSEL_B(EI, COL, ROW, CH) \
+            if ((CH) < 2) { \
+                int32_t v = ((CH) == 0) ? frag_acc0.x[EI] : frag_acc1.x[EI]; \
+                S_sh[(COL) * TILE + (ROW)] = (int8_t)(v > 0 ? 1 : 0); \
+            }
+
+        REGSEL_B(0, col_lo,     row_lo, ch0)
+        REGSEL_B(1, col_lo + 1, row_lo, ch1)
+        REGSEL_B(2, col_lo,     row_hi, ch0)
+        REGSEL_B(3, col_lo + 1, row_hi, ch1)
+        REGSEL_B(4, col_hi,     row_lo, ch2)
+        REGSEL_B(5, col_hi + 1, row_lo, ch3)
+        REGSEL_B(6, col_hi,     row_hi, ch2)
+        REGSEL_B(7, col_hi + 1, row_hi, ch3)
+
+        #undef REGSEL_B
+
+        __syncwarp();
+    }
+
+    for (int col = lane; col < TILE; col += WARP_SIZE) {
+        int string_id = warp_col_start + col;
+        if (string_id >= B) continue;
+        int accepted = 0;
+        for (int r = 0; r < TILE; r++) {
+            if (S_sh[col * TILE + r] > 0 && accept_mask[r] != 0) {
+                accepted = 1;
+                break;
+            }
+        }
+        results[string_id] = accepted;
+    }
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 8)
+batched_evolution_binary_v3_kernel(
+    const int8_t  *__restrict__ T0_global,
+    const int8_t  *__restrict__ T1_global,
+    const uint8_t *__restrict__ input,
+    const int8_t  *__restrict__ accept_mask,
+    const int8_t  *__restrict__ start_vec,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    binary_v2_body(T0_global, T1_global, input, accept_mask, start_vec,
+                   B, B_padded, L, results);
+}
+
+
+__forceinline__ __device__ void binary_v4_body(
+    const int8_t *T0_global, const int8_t *T1_global,
+    const uint8_t *input, const int8_t *accept_mask,
+    const int8_t *start_vec, int B, int B_padded, int L,
+    int *results)
+{
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int block_col_start = blockIdx.x * COLS_PER_BLOCK;
+    int warp_col_start = block_col_start + warp_in_block * TILE;
+
+    extern __shared__ char smem_raw[];
+    int8_t *T0_sh = (int8_t *)smem_raw;
+    int8_t *T1_sh = T0_sh + TILE_ELEMS;
+    int8_t *S_base = T1_sh + TILE_ELEMS;
+    int8_t *S_sh = S_base + warp_in_block * TILE_ELEMS;
+
+    for (int e = threadIdx.x; e < TILE_ELEMS; e += blockDim.x) {
+        T0_sh[e] = T0_global[e];
+        T1_sh[e] = T1_global[e];
+    }
+    for (int e = lane; e < TILE_ELEMS; e += WARP_SIZE) {
+        S_sh[e] = start_vec[e % TILE];
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> frag_T0, frag_T1;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> frag_S;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> frag_acc0, frag_acc1;
+
+    wmma::load_matrix_sync(frag_T0, T0_sh, TILE);
+    wmma::load_matrix_sync(frag_T1, T1_sh, TILE);
+    wmma::load_matrix_sync(frag_S, S_sh, TILE);
+
+    int8_t s_prev[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) s_prev[i] = frag_S.x[i];
+
+    int matb_col_lo = lane >> 2;
+    int matb_col_hi = matb_col_lo + 8;
+
+    for (int t = 0; t < L; t++) {
+        wmma::fill_fragment(frag_acc0, 0);
+        wmma::mma_sync(frag_acc0, frag_T0, frag_S, frag_acc0);
+        wmma::fill_fragment(frag_acc1, 0);
+        wmma::mma_sync(frag_acc1, frag_T1, frag_S, frag_acc1);
+
+        uint8_t my_ch = 2;
+        if (lane < TILE) {
+            int sid = warp_col_start + lane;
+            if (sid < B_padded) my_ch = input[t * B_padded + sid];
+        }
+
+        // Chars for the 4 ACC columns this thread owns
+        int acc_col_lo = (lane & 3) << 1;
+        uint8_t ach0 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, acc_col_lo);
+        uint8_t ach1 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, acc_col_lo | 1);
+        uint8_t ach2 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, acc_col_lo | 8);
+        uint8_t ach3 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, acc_col_lo | 9);
+
+        // Select + threshold in acc layout (for identity cols, result is unused)
+        int8_t s_new[8];
+        s_new[0] = (int8_t)(((ach0 == 1) ? frag_acc1.x[0] : frag_acc0.x[0]) > 0 ? 1 : 0);
+        s_new[1] = (int8_t)(((ach1 == 1) ? frag_acc1.x[1] : frag_acc0.x[1]) > 0 ? 1 : 0);
+        s_new[2] = (int8_t)(((ach0 == 1) ? frag_acc1.x[2] : frag_acc0.x[2]) > 0 ? 1 : 0);
+        s_new[3] = (int8_t)(((ach1 == 1) ? frag_acc1.x[3] : frag_acc0.x[3]) > 0 ? 1 : 0);
+        s_new[4] = (int8_t)(((ach2 == 1) ? frag_acc1.x[4] : frag_acc0.x[4]) > 0 ? 1 : 0);
+        s_new[5] = (int8_t)(((ach3 == 1) ? frag_acc1.x[5] : frag_acc0.x[5]) > 0 ? 1 : 0);
+        s_new[6] = (int8_t)(((ach2 == 1) ? frag_acc1.x[6] : frag_acc0.x[6]) > 0 ? 1 : 0);
+        s_new[7] = (int8_t)(((ach3 == 1) ? frag_acc1.x[7] : frag_acc0.x[7]) > 0 ? 1 : 0);
+
+        // Pack into two int32 for shuffling
+        int pack_lo = ((int)(uint8_t)s_new[0])       | ((int)(uint8_t)s_new[1] << 8) |
+                      ((int)(uint8_t)s_new[2] << 16) | ((int)(uint8_t)s_new[3] << 24);
+        int pack_hi = ((int)(uint8_t)s_new[4])       | ((int)(uint8_t)s_new[5] << 8) |
+                      ((int)(uint8_t)s_new[6] << 16) | ((int)(uint8_t)s_new[7] << 24);
+
+        // Chars for the 2 matrix_b columns (identity check at destination)
+        uint8_t mch_lo = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, matb_col_lo);
+        uint8_t mch_hi = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, matb_col_hi);
+
+        // Redistribute acc→matb via 8 shuffles, conditionally update frag_S
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int dst_row = (lane & 3) * 4 + (i & 3);
+            int src_lane = (dst_row & 7) * 4 + (lane >> 3);
+            int src_i = ((lane >> 2) & 1) | ((dst_row >= 8) << 1) | ((i >= 4) << 2);
+
+            int pack = (i < 4) ? __shfl_sync(0xFFFFFFFF, pack_lo, src_lane)
+                               : __shfl_sync(0xFFFFFFFF, pack_hi, src_lane);
+            int8_t val = (int8_t)((pack >> ((src_i & 3) * 8)) & 0xFF);
+
+            uint8_t ch = (i < 4) ? mch_lo : mch_hi;
+            frag_S.x[i] = (ch < 2) ? val : s_prev[i];
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) s_prev[i] = frag_S.x[i];
+    }
+
+    // Write final frag_S to shared memory for accept check
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int row = (lane & 3) * 4 + (i & 3);
+        int col = (lane >> 2) + ((i >> 2) << 3);
+        S_sh[col * TILE + row] = frag_S.x[i];
+    }
+    __syncwarp();
+
+    for (int col = lane; col < TILE; col += WARP_SIZE) {
+        int string_id = warp_col_start + col;
+        if (string_id >= B) continue;
+        int accepted = 0;
+        for (int r = 0; r < TILE; r++) {
+            if (S_sh[col * TILE + r] > 0 && accept_mask[r] != 0) {
+                accepted = 1;
+                break;
+            }
+        }
+        results[string_id] = accepted;
+    }
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 16)
+batched_evolution_binary_v4_kernel(
+    const int8_t  *__restrict__ T0_global,
+    const int8_t  *__restrict__ T1_global,
+    const uint8_t *__restrict__ input,
+    const int8_t  *__restrict__ accept_mask,
+    const int8_t  *__restrict__ start_vec,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    binary_v4_body(T0_global, T1_global, input, accept_mask, start_vec,
+                   B, B_padded, L, results);
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 8)
+batched_evolution_binary_v5_kernel(
+    const int8_t  *__restrict__ T0_global,
+    const int8_t  *__restrict__ T1_global,
+    const uint8_t *__restrict__ input,
+    const int8_t  *__restrict__ accept_mask,
+    const int8_t  *__restrict__ start_vec,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    binary_v4_body(T0_global, T1_global, input, accept_mask, start_vec,
+                   B, B_padded, L, results);
 }
 
 
@@ -953,6 +1228,93 @@ struct BatchedEngine {
         return 0;
     }
 
+    int dispatch_v3(const uint8_t *h_input, int B, int L, int B_padded,
+                    int *h_results, float *kernel_ms, float *total_ms) {
+        if (!initialized) return -1;
+        if (sigma != 2 || N > TILE) return -2;
+
+        CHECK_CUDA(cudaEventRecord(ev_start));
+        size_t input_bytes = (size_t)L * B_padded;
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaEventRecord(ev_kern_start));
+
+        int n_blocks = B_padded / COLS_PER_BLOCK;
+        int smem = 2 * TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS;
+        batched_evolution_binary_v3_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+            d_trans, d_trans + TILE_ELEMS,
+            d_input, d_accept, d_start_vec,
+            B, B_padded, L, d_results);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(ev_kern_stop));
+
+        CHECK_CUDA(cudaMemcpy(h_results, d_results, (size_t)B * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaEventRecord(ev_stop));
+        CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
+        if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
+        return 0;
+    }
+
+    int dispatch_v4(const uint8_t *h_input, int B, int L, int B_padded,
+                    int *h_results, float *kernel_ms, float *total_ms) {
+        if (!initialized) return -1;
+        if (sigma != 2 || N > TILE) return -2;
+
+        CHECK_CUDA(cudaEventRecord(ev_start));
+        size_t input_bytes = (size_t)L * B_padded;
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaEventRecord(ev_kern_start));
+
+        int n_blocks = B_padded / COLS_PER_BLOCK;
+        int smem = 2 * TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS;
+        batched_evolution_binary_v4_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+            d_trans, d_trans + TILE_ELEMS,
+            d_input, d_accept, d_start_vec,
+            B, B_padded, L, d_results);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(ev_kern_stop));
+
+        CHECK_CUDA(cudaMemcpy(h_results, d_results, (size_t)B * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaEventRecord(ev_stop));
+        CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
+        if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
+        return 0;
+    }
+
+    int dispatch_v5(const uint8_t *h_input, int B, int L, int B_padded,
+                    int *h_results, float *kernel_ms, float *total_ms) {
+        if (!initialized) return -1;
+        if (sigma != 2 || N > TILE) return -2;
+
+        CHECK_CUDA(cudaEventRecord(ev_start));
+        size_t input_bytes = (size_t)L * B_padded;
+        CHECK_CUDA(cudaMemcpy(d_input, h_input, input_bytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaEventRecord(ev_kern_start));
+
+        int n_blocks = B_padded / COLS_PER_BLOCK;
+        int smem = 2 * TILE_ELEMS + WARPS_PER_BLOCK * TILE_ELEMS;
+        batched_evolution_binary_v5_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+            d_trans, d_trans + TILE_ELEMS,
+            d_input, d_accept, d_start_vec,
+            B, B_padded, L, d_results);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaEventRecord(ev_kern_stop));
+
+        CHECK_CUDA(cudaMemcpy(h_results, d_results, (size_t)B * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaEventRecord(ev_stop));
+        CHECK_CUDA(cudaEventSynchronize(ev_stop));
+
+        if (kernel_ms) cudaEventElapsedTime(kernel_ms, ev_kern_start, ev_kern_stop);
+        if (total_ms)  cudaEventElapsedTime(total_ms, ev_start, ev_stop);
+        return 0;
+    }
+
     // Dispatch: input is [L][B_padded] position-contiguous, already on host
     // B_padded must be multiple of COLS_PER_BLOCK
     int dispatch(const uint8_t *h_input, int B, int L, int B_padded,
@@ -1135,6 +1497,30 @@ int batched_engine_dispatch_v2(const uint8_t *input,
                                float *kernel_ms, float *total_ms) {
     int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
     return g_engine.dispatch_v2(input, B, L, B_padded, results, kernel_ms, total_ms);
+}
+
+int batched_engine_dispatch_v3(const uint8_t *input,
+                               int B, int L,
+                               int *results,
+                               float *kernel_ms, float *total_ms) {
+    int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+    return g_engine.dispatch_v3(input, B, L, B_padded, results, kernel_ms, total_ms);
+}
+
+int batched_engine_dispatch_v4(const uint8_t *input,
+                               int B, int L,
+                               int *results,
+                               float *kernel_ms, float *total_ms) {
+    int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+    return g_engine.dispatch_v4(input, B, L, B_padded, results, kernel_ms, total_ms);
+}
+
+int batched_engine_dispatch_v5(const uint8_t *input,
+                               int B, int L,
+                               int *results,
+                               float *kernel_ms, float *total_ms) {
+    int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+    return g_engine.dispatch_v5(input, B, L, B_padded, results, kernel_ms, total_ms);
 }
 
 int batched_engine_dispatch_multi(
@@ -1543,20 +1929,24 @@ static void test_prepare_input() {
 
 
 static void bench_throughput() {
-    printf("\n=== Throughput Benchmark: V1 vs V2 (binary kernel) ===\n");
+    printf("\n=== Throughput Benchmark: V2/V3/V4/V5 (binary kernel) ===\n");
+    printf("  V2 = regsel, smem S (launch_bounds 16, 32 regs)\n");
+    printf("  V3 = regsel, smem S (launch_bounds 8, 40 regs)\n");
+    printf("  V4 = register pipeline, no smem S (launch_bounds 16)\n");
+    printf("  V5 = register pipeline, no smem S (launch_bounds 8)\n\n");
     EvenADFA dfa;
     int8_t start_vec[TILE];
     memset(start_vec, 0, TILE);
     start_vec[0] = 1;
 
-    int batch_sizes[] = {1024, 4096, 16384, 65536, 262144};
+    int batch_sizes[] = {4096, 65536, 262144};
     int lengths[]     = {128, 512, 2048};
-    int n_batches = 5, n_lengths = 3;
+    int n_batches = 3, n_lengths = 3;
     int identity_idx = 2;
 
-    printf("  %8s  %8s  |  %10s  %10s  |  %10s  %10s  | speedup\n",
-           "B", "L", "V1 kern ms", "V1 Gc/s", "V2 kern ms", "V2 Gc/s");
-    printf("  %s\n", "--------------------------------------------------------------------------");
+    printf("  %8s  %6s  |  %8s  %8s  %8s  %8s  | best\n",
+           "B", "L", "V2 Gc/s", "V3 Gc/s", "V4 Gc/s", "V5 Gc/s");
+    printf("  %s\n", "----------------------------------------------------------------------");
 
     for (int bi = 0; bi < n_batches; bi++) {
         for (int li = 0; li < n_lengths; li++) {
@@ -1577,32 +1967,35 @@ static void bench_throughput() {
 
             int *results = new int[B];
 
-            // Warmup both
+            // Warmup all variants
             for (int w = 0; w < 3; w++) {
-                eng.dispatch(input, B, L, B_padded, results, nullptr, nullptr);
                 eng.dispatch_v2(input, B, L, B_padded, results, nullptr, nullptr);
+                eng.dispatch_v3(input, B, L, B_padded, results, nullptr, nullptr);
+                eng.dispatch_v4(input, B, L, B_padded, results, nullptr, nullptr);
+                eng.dispatch_v5(input, B, L, B_padded, results, nullptr, nullptr);
             }
 
             int iters = 20;
-            float v1_kern = 0, v2_kern = 0;
+            float kerns[4] = {0, 0, 0, 0};
             for (int it = 0; it < iters; it++) {
                 float km;
-                eng.dispatch(input, B, L, B_padded, results, &km, nullptr);
-                v1_kern += km;
+                eng.dispatch_v2(input, B, L, B_padded, results, &km, nullptr); kerns[0] += km;
+                eng.dispatch_v3(input, B, L, B_padded, results, &km, nullptr); kerns[1] += km;
+                eng.dispatch_v4(input, B, L, B_padded, results, &km, nullptr); kerns[2] += km;
+                eng.dispatch_v5(input, B, L, B_padded, results, &km, nullptr); kerns[3] += km;
             }
-            for (int it = 0; it < iters; it++) {
-                float km;
-                eng.dispatch_v2(input, B, L, B_padded, results, &km, nullptr);
-                v2_kern += km;
-            }
-            v1_kern /= iters;
-            v2_kern /= iters;
             double chars = (double)B * L;
-            double v1_gchs = chars / (v1_kern * 1e6);
-            double v2_gchs = chars / (v2_kern * 1e6);
+            double gchs[4];
+            int best = 0;
+            for (int v = 0; v < 4; v++) {
+                kerns[v] /= iters;
+                gchs[v] = chars / (kerns[v] * 1e6);
+                if (gchs[v] > gchs[best]) best = v;
+            }
+            const char *names[] = {"V2", "V3", "V4", "V5"};
 
-            printf("  %8d  %8d  |  %10.4f  %10.3f  |  %10.4f  %10.3f  |  %.2fx\n",
-                   B, L, v1_kern, v1_gchs, v2_kern, v2_gchs, v1_kern / v2_kern);
+            printf("  %8d  %6d  |  %8.1f  %8.1f  %8.1f  %8.1f  | %s\n",
+                   B, L, gchs[0], gchs[1], gchs[2], gchs[3], names[best]);
 
             delete[] input;
             delete[] results;
@@ -1671,6 +2064,98 @@ int main() {
         check(msg, mismatches == 0);
 
         delete[] inp; delete[] res_v1; delete[] res_v2;
+        eng.destroy();
+    }
+
+    // V3/V4/V5 correctness: compare against V1 on large random batch
+    {
+        printf("\n--- test_v3_v4_v5_correctness (V3/V4/V5 vs V1) ---\n");
+        EvenADFA dfa;
+        int8_t sv[TILE];
+        memset(sv, 0, TILE);
+        sv[0] = 1;
+
+        int B = 4096, L = 256;
+        int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+
+        BatchedEngine eng;
+        eng.init(TILE, 2, dfa.trans, dfa.accept, sv, B_padded, L);
+
+        srand(88);
+        size_t input_size = (size_t)L * B_padded;
+        uint8_t *inp = new uint8_t[input_size];
+        memset(inp, (uint8_t)2, input_size);
+        for (int b = 0; b < B; b++)
+            for (int t = 0; t < L; t++)
+                inp[t * B_padded + b] = rand() % 2;
+
+        int *res_v1 = new int[B];
+        int *res_vx = new int[B];
+        float km;
+        eng.dispatch(inp, B, L, B_padded, res_v1, &km, nullptr);
+
+        // V3
+        eng.dispatch_v3(inp, B, L, B_padded, res_vx, &km, nullptr);
+        int mm3 = 0;
+        for (int b = 0; b < B; b++) if (res_v1[b] != res_vx[b]) mm3++;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "V3 vs V1 B=%d L=%d (%d mismatches)", B, L, mm3);
+        check(msg, mm3 == 0);
+
+        // V4
+        eng.dispatch_v4(inp, B, L, B_padded, res_vx, &km, nullptr);
+        int mm4 = 0;
+        for (int b = 0; b < B; b++) if (res_v1[b] != res_vx[b]) mm4++;
+        snprintf(msg, sizeof(msg), "V4 vs V1 B=%d L=%d (%d mismatches)", B, L, mm4);
+        check(msg, mm4 == 0);
+
+        // V5
+        eng.dispatch_v5(inp, B, L, B_padded, res_vx, &km, nullptr);
+        int mm5 = 0;
+        for (int b = 0; b < B; b++) if (res_v1[b] != res_vx[b]) mm5++;
+        snprintf(msg, sizeof(msg), "V5 vs V1 B=%d L=%d (%d mismatches)", B, L, mm5);
+        check(msg, mm5 == 0);
+
+        delete[] inp; delete[] res_v1; delete[] res_vx;
+        eng.destroy();
+    }
+
+    // V4 correctness with variable-length strings (identity handling)
+    {
+        printf("\n--- test_v4_identity (variable-length strings) ---\n");
+        EvenADFA dfa;
+        int8_t sv[TILE];
+        memset(sv, 0, TILE);
+        sv[0] = 1;
+
+        int B = 1024, L = 128;
+        int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+
+        BatchedEngine eng;
+        eng.init(TILE, 2, dfa.trans, dfa.accept, sv, B_padded, L);
+
+        srand(99);
+        size_t input_size = (size_t)L * B_padded;
+        uint8_t *inp = new uint8_t[input_size];
+        memset(inp, (uint8_t)2, input_size);
+        for (int b = 0; b < B; b++) {
+            int str_len = 1 + rand() % L;
+            for (int t = 0; t < str_len; t++)
+                inp[t * B_padded + b] = rand() % 2;
+        }
+
+        int *res_v1 = new int[B], *res_v4 = new int[B];
+        float km;
+        eng.dispatch(inp, B, L, B_padded, res_v1, &km, nullptr);
+        eng.dispatch_v4(inp, B, L, B_padded, res_v4, &km, nullptr);
+
+        int mm = 0;
+        for (int b = 0; b < B; b++) if (res_v1[b] != res_v4[b]) mm++;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "V4 identity B=%d L=%d varlen (%d mismatches)", B, L, mm);
+        check(msg, mm == 0);
+
+        delete[] inp; delete[] res_v1; delete[] res_v4;
         eng.destroy();
     }
 

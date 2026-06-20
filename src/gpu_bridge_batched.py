@@ -146,7 +146,7 @@ class BatchedEvolutionEngine:
         kern_ms = ctypes.c_float(0)
         total_ms = ctypes.c_float(0)
 
-        dispatch_fn = (self.lib.batched_engine_dispatch_v2
+        dispatch_fn = (self.lib.batched_engine_dispatch_v3
                        if self.regsel
                        else self.lib.batched_engine_dispatch)
         rc = dispatch_fn(
@@ -181,7 +181,7 @@ class BatchedEvolutionEngine:
         kern_ms = ctypes.c_float(0)
         total_ms = ctypes.c_float(0)
 
-        dispatch_fn = (self.lib.batched_engine_dispatch_v2
+        dispatch_fn = (self.lib.batched_engine_dispatch_v3
                        if self.regsel
                        else self.lib.batched_engine_dispatch)
         rc = dispatch_fn(
@@ -232,6 +232,15 @@ class BatchedGPUSimulator:
 
         self.lib.batched_engine_dispatch_v2.restype = ctypes.c_int
         self.lib.batched_engine_dispatch_v2.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+
+        self.lib.batched_engine_dispatch_v3.restype = ctypes.c_int
+        self.lib.batched_engine_dispatch_v3.argtypes = [
             ctypes.POINTER(ctypes.c_uint8),
             ctypes.c_int, ctypes.c_int,
             ctypes.POINTER(ctypes.c_int),

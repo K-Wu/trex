@@ -286,6 +286,330 @@ nfa_tc_binary_v3_kernel(
 }
 
 
+// ---- NFA Binary Kernel V3.5 (partial T-caching, higher occupancy) --------
+//
+// Caches T for the first 2 row-tiles in registers, reloads T for the
+// remaining 2 from shared memory each position.  ~103 regs → 4 blocks/SM
+// (vs V3's 2 blocks/SM).  Trades 16 extra smem loads/position for 2x warps.
+//
+// The goal: more warps → better TC utilization via warp-level interleaving.
+// While one warp stalls on mma_sync, the scheduler runs other warps.
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 4)
+nfa_tc_binary_v35_kernel(
+    const half    *__restrict__ T0_global,
+    const half    *__restrict__ T1_global,
+    const uint8_t *__restrict__ input,
+    const half    *__restrict__ accept_mask,
+    const half    *__restrict__ start_vec,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int block_col_start = blockIdx.x * COLS_PER_BLOCK;
+    int warp_col_start = block_col_start + warp_in_block * TILE;
+
+    extern __shared__ char smem_raw[];
+    half *T0_sh = (half *)smem_raw;
+    half *T1_sh = T0_sh + N_ELEMS;
+    half *S_base = T1_sh + N_ELEMS;
+    half *S_sh = S_base + warp_in_block * N * TILE;
+
+    for (int e = threadIdx.x; e < N_ELEMS; e += blockDim.x) {
+        T0_sh[e] = T0_global[e];
+        T1_sh[e] = T1_global[e];
+    }
+    for (int e = lane; e < N * TILE; e += WARP_SIZE) {
+        int row = e % N;
+        S_sh[e] = start_vec[row];
+    }
+    __syncthreads();
+
+    // Cache T for first 2 row-tiles only (16 fragments, ~64 regs)
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_T0_c[2][NTILES];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_T1_c[2][NTILES];
+
+    for (int mt = 0; mt < 2; mt++)
+        for (int kt = 0; kt < NTILES; kt++) {
+            wmma::load_matrix_sync(frag_T0_c[mt][kt], T0_sh + mt * TILE * N + kt * TILE, N);
+            wmma::load_matrix_sync(frag_T1_c[mt][kt], T1_sh + mt * TILE * N + kt * TILE, N);
+        }
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_T0_r, frag_T1_r;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_S[NTILES];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_acc0, frag_acc1;
+
+    half h_zero = __float2half(0.0f);
+    half h_one  = __float2half(1.0f);
+
+    int col_lo = (lane & 3) * 2;
+    int col_hi = col_lo + 8;
+    int row_lo = lane >> 2;
+    int row_hi = row_lo + 8;
+
+    for (int t = 0; t < L; t++) {
+        for (int kt = 0; kt < NTILES; kt++)
+            wmma::load_matrix_sync(frag_S[kt], S_sh + kt * TILE, N);
+
+        uint8_t my_ch = 2;
+        if (lane < TILE) {
+            int sid = warp_col_start + lane;
+            if (sid < B_padded) my_ch = input[t * B_padded + sid];
+        }
+        uint8_t ch0 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo);
+        uint8_t ch1 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo + 1);
+        uint8_t ch2 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi);
+        uint8_t ch3 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi + 1);
+
+        // Row-tiles 0-1: from cached fragments
+        for (int mt = 0; mt < 2; mt++) {
+            wmma::fill_fragment(frag_acc0, h_zero);
+            wmma::fill_fragment(frag_acc1, h_zero);
+
+            for (int kt = 0; kt < NTILES; kt++) {
+                wmma::mma_sync(frag_acc0, frag_T0_c[mt][kt], frag_S[kt], frag_acc0);
+                wmma::mma_sync(frag_acc1, frag_T1_c[mt][kt], frag_S[kt], frag_acc1);
+            }
+
+            int row_off = mt * TILE;
+
+            #define NFA_REGSEL35C(EI, COL, ROW, CH) \
+                if ((CH) < 2) { \
+                    half v = ((CH) == 0) ? frag_acc0.x[EI] : frag_acc1.x[EI]; \
+                    S_sh[(COL) * N + (ROW)] = __hgt(v, h_zero) ? h_one : h_zero; \
+                }
+
+            NFA_REGSEL35C(0, col_lo,     row_off + row_lo, ch0)
+            NFA_REGSEL35C(1, col_lo + 1, row_off + row_lo, ch1)
+            NFA_REGSEL35C(2, col_lo,     row_off + row_hi, ch0)
+            NFA_REGSEL35C(3, col_lo + 1, row_off + row_hi, ch1)
+            NFA_REGSEL35C(4, col_hi,     row_off + row_lo, ch2)
+            NFA_REGSEL35C(5, col_hi + 1, row_off + row_lo, ch3)
+            NFA_REGSEL35C(6, col_hi,     row_off + row_hi, ch2)
+            NFA_REGSEL35C(7, col_hi + 1, row_off + row_hi, ch3)
+
+            #undef NFA_REGSEL35C
+        }
+
+        // Row-tiles 2-3: reload T from smem each position
+        for (int mt = 2; mt < NTILES; mt++) {
+            wmma::fill_fragment(frag_acc0, h_zero);
+            wmma::fill_fragment(frag_acc1, h_zero);
+
+            for (int kt = 0; kt < NTILES; kt++) {
+                wmma::load_matrix_sync(frag_T0_r, T0_sh + mt * TILE * N + kt * TILE, N);
+                wmma::load_matrix_sync(frag_T1_r, T1_sh + mt * TILE * N + kt * TILE, N);
+                wmma::mma_sync(frag_acc0, frag_T0_r, frag_S[kt], frag_acc0);
+                wmma::mma_sync(frag_acc1, frag_T1_r, frag_S[kt], frag_acc1);
+            }
+
+            int row_off = mt * TILE;
+
+            #define NFA_REGSEL35R(EI, COL, ROW, CH) \
+                if ((CH) < 2) { \
+                    half v = ((CH) == 0) ? frag_acc0.x[EI] : frag_acc1.x[EI]; \
+                    S_sh[(COL) * N + (ROW)] = __hgt(v, h_zero) ? h_one : h_zero; \
+                }
+
+            NFA_REGSEL35R(0, col_lo,     row_off + row_lo, ch0)
+            NFA_REGSEL35R(1, col_lo + 1, row_off + row_lo, ch1)
+            NFA_REGSEL35R(2, col_lo,     row_off + row_hi, ch0)
+            NFA_REGSEL35R(3, col_lo + 1, row_off + row_hi, ch1)
+            NFA_REGSEL35R(4, col_hi,     row_off + row_lo, ch2)
+            NFA_REGSEL35R(5, col_hi + 1, row_off + row_lo, ch3)
+            NFA_REGSEL35R(6, col_hi,     row_off + row_hi, ch2)
+            NFA_REGSEL35R(7, col_hi + 1, row_off + row_hi, ch3)
+
+            #undef NFA_REGSEL35R
+        }
+        __syncwarp();
+    }
+
+    for (int col = lane; col < TILE; col += WARP_SIZE) {
+        int string_id = warp_col_start + col;
+        if (string_id >= B) continue;
+        int accepted = 0;
+        for (int r = 0; r < N; r++) {
+            if (__hgt(S_sh[col * N + r], h_zero) &&
+                __hgt(accept_mask[r], h_zero)) {
+                accepted = 1;
+                break;
+            }
+        }
+        results[string_id] = accepted;
+    }
+}
+
+
+// ---- V5: Probabilistic NFA (TC, real-valued, no Boolean threshold) -------
+//
+// Same architecture as V3 (all T fragments cached) but operates on real-valued
+// state vectors and transition matrices.  No {0,1} thresholding — the state
+// evolves as s' = T[ch] × s with FP16 matmul.  Accept = dot(s, accept_weights).
+//
+// This is the HMM forward algorithm / weighted NFA / probabilistic automaton.
+// TC dominates here because no bitwise shortcut exists for real-valued matmul.
+// Measured throughput should match V3 (~200 TFLOPS) which already exceeds the
+// H200's CUDA-core FP16 peak of 134 TFLOPS.
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 2)
+nfa_prob_v5_tc_kernel(
+    const half    *__restrict__ T0_global,
+    const half    *__restrict__ T1_global,
+    const uint8_t *__restrict__ input,
+    const half    *__restrict__ accept_weights,
+    const half    *__restrict__ start_vec,
+    int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x % WARP_SIZE;
+    int block_col_start = blockIdx.x * COLS_PER_BLOCK;
+    int warp_col_start = block_col_start + warp_in_block * TILE;
+
+    extern __shared__ char smem_raw[];
+    half *T0_sh = (half *)smem_raw;
+    half *T1_sh = T0_sh + N_ELEMS;
+    half *S_base = T1_sh + N_ELEMS;
+    half *S_sh = S_base + warp_in_block * N * TILE;
+
+    for (int e = threadIdx.x; e < N_ELEMS; e += blockDim.x) {
+        T0_sh[e] = T0_global[e];
+        T1_sh[e] = T1_global[e];
+    }
+    for (int e = lane; e < N * TILE; e += WARP_SIZE) {
+        int row = e % N;
+        S_sh[e] = start_vec[row];
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_T0[NTILES][NTILES];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_T1[NTILES][NTILES];
+
+    for (int mt = 0; mt < NTILES; mt++)
+        for (int kt = 0; kt < NTILES; kt++) {
+            wmma::load_matrix_sync(frag_T0[mt][kt], T0_sh + mt * TILE * N + kt * TILE, N);
+            wmma::load_matrix_sync(frag_T1[mt][kt], T1_sh + mt * TILE * N + kt * TILE, N);
+        }
+
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_S[NTILES];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_acc0, frag_acc1;
+
+    half h_zero = __float2half(0.0f);
+
+    int col_lo = (lane & 3) * 2;
+    int col_hi = col_lo + 8;
+    int row_lo = lane >> 2;
+    int row_hi = row_lo + 8;
+
+    for (int t = 0; t < L; t++) {
+        for (int kt = 0; kt < NTILES; kt++)
+            wmma::load_matrix_sync(frag_S[kt], S_sh + kt * TILE, N);
+
+        uint8_t my_ch = 2;
+        if (lane < TILE) {
+            int sid = warp_col_start + lane;
+            if (sid < B_padded) my_ch = input[t * B_padded + sid];
+        }
+        uint8_t ch0 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo);
+        uint8_t ch1 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_lo + 1);
+        uint8_t ch2 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi);
+        uint8_t ch3 = (uint8_t)__shfl_sync(0xFFFFFFFF, my_ch, col_hi + 1);
+
+        for (int mt = 0; mt < NTILES; mt++) {
+            wmma::fill_fragment(frag_acc0, h_zero);
+            wmma::fill_fragment(frag_acc1, h_zero);
+
+            for (int kt = 0; kt < NTILES; kt++) {
+                wmma::mma_sync(frag_acc0, frag_T0[mt][kt], frag_S[kt], frag_acc0);
+                wmma::mma_sync(frag_acc1, frag_T1[mt][kt], frag_S[kt], frag_acc1);
+            }
+
+            int row_off = mt * TILE;
+
+            // No thresholding — store real-valued result directly
+            #define PROB_REGSEL(EI, COL, ROW, CH) \
+                if ((CH) < 2) { \
+                    S_sh[(COL) * N + (ROW)] = \
+                        ((CH) == 0) ? frag_acc0.x[EI] : frag_acc1.x[EI]; \
+                }
+
+            PROB_REGSEL(0, col_lo,     row_off + row_lo, ch0)
+            PROB_REGSEL(1, col_lo + 1, row_off + row_lo, ch1)
+            PROB_REGSEL(2, col_lo,     row_off + row_hi, ch0)
+            PROB_REGSEL(3, col_lo + 1, row_off + row_hi, ch1)
+            PROB_REGSEL(4, col_hi,     row_off + row_lo, ch2)
+            PROB_REGSEL(5, col_hi + 1, row_off + row_lo, ch3)
+            PROB_REGSEL(6, col_hi,     row_off + row_hi, ch2)
+            PROB_REGSEL(7, col_hi + 1, row_off + row_hi, ch3)
+
+            #undef PROB_REGSEL
+        }
+        __syncwarp();
+    }
+
+    // Dot product: sum(s[i] * accept_weights[i])
+    for (int col = lane; col < TILE; col += WARP_SIZE) {
+        int string_id = warp_col_start + col;
+        if (string_id >= B) continue;
+        half dot = h_zero;
+        for (int r = 0; r < N; r++)
+            dot = __hadd(dot, __hmul(S_sh[col * N + r], accept_weights[r]));
+        results[string_id] = __hgt(dot, __float2half(0.5f)) ? 1 : 0;
+    }
+}
+
+
+// ---- V6: CUDA-core FP16 baseline (no TC, real-valued matmul) -------------
+//
+// Each thread handles one string.  Per position: explicit FP16 matrix-vector
+// multiply using CUDA FP16 intrinsics.  No tensor cores.
+// This is the throughput ceiling for CUDA cores at N=64 FP16 matmul.
+
+constexpr int THREADS_V6 = 128;
+
+__global__ void __launch_bounds__(THREADS_V6, 8)
+nfa_prob_v6_cuda_kernel(
+    const half    *__restrict__ T_global,   // [sigma * N * N] row-major
+    const uint8_t *__restrict__ input,
+    const half    *__restrict__ accept_weights,
+    const half    *__restrict__ start_vec,
+    int sigma, int B, int B_padded, int L,
+    int *__restrict__ results
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= B) return;
+
+    // Load state into registers
+    half state[N], new_state[N];
+    for (int i = 0; i < N; i++)
+        state[i] = start_vec[i];
+
+    for (int t = 0; t < L; t++) {
+        uint8_t ch = input[t * B_padded + tid];
+        const half *T = T_global + (int)ch * N_ELEMS;
+
+        // Matrix-vector multiply: new_state = T × state
+        for (int row = 0; row < N; row++) {
+            half acc = __float2half(0.0f);
+            for (int k = 0; k < N; k++)
+                acc = __hfma(T[row * N + k], state[k], acc);
+            new_state[row] = acc;
+        }
+
+        for (int i = 0; i < N; i++)
+            state[i] = new_state[i];
+    }
+
+    // Dot product for accept
+    half dot = __float2half(0.0f);
+    for (int r = 0; r < N; r++)
+        dot = __hadd(dot, __hmul(state[r], accept_weights[r]));
+    results[tid] = __hgt(dot, __float2half(0.5f)) ? 1 : 0;
+}
+
+
 // ---- Bit-parallel Pre-composition (host-side, for V4) --------------------
 //
 // For K=4, σ=2: pre-compose T_{c3} × T_{c2} × T_{c1} × T_{c0} for all 16
@@ -429,7 +753,7 @@ struct NFATCEngine {
     int max_B;
     int max_L;
     int B_padded_max;
-    int kernel_variant;    // 2=V2(reload T), 3=V3(T in registers)
+    int kernel_variant;    // 2=V2, 3=V3(T cached), 35=V3.5(partial cache), 4=V4(bitpar)
 
     half    *d_T;
     half    *d_accept;
@@ -554,7 +878,19 @@ struct NFATCEngine {
 
         CHECK_CUDA(cudaEventRecord(ev_kern_start));
 
-        if (kernel_variant == 4) {
+        if (kernel_variant == 6) {
+            int n_blocks_v6 = (B_padded + THREADS_V6 - 1) / THREADS_V6;
+            nfa_prob_v6_cuda_kernel<<<n_blocks_v6, THREADS_V6>>>(
+                d_T, d_input, d_accept, d_start_vec,
+                sigma, B, B_padded, L_val, d_results);
+        } else if (kernel_variant == 5) {
+            int n_blocks = B_padded / COLS_PER_BLOCK;
+            int smem = (2 * N_ELEMS + WARPS_PER_BLOCK * N * TILE) * (int)sizeof(half);
+            nfa_prob_v5_tc_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                d_T, d_T + N_ELEMS,
+                d_input, d_accept, d_start_vec,
+                B, B_padded, L_val, d_results);
+        } else if (kernel_variant == 4) {
             int n_blocks_v4 = (B_padded + THREADS_V4 - 1) / THREADS_V4;
             int smem_v4 = (N * N_PATTERNS_V4 + 2 * N) * (int)sizeof(uint64_t);
             nfa_bitpar_v4_kernel<<<n_blocks_v4, THREADS_V4, smem_v4>>>(
@@ -564,7 +900,12 @@ struct NFATCEngine {
         } else {
             int n_blocks = B_padded / COLS_PER_BLOCK;
             int smem = (2 * N_ELEMS + WARPS_PER_BLOCK * N * TILE) * (int)sizeof(half);
-            if (kernel_variant == 3) {
+            if (kernel_variant == 35) {
+                nfa_tc_binary_v35_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
+                    d_T, d_T + N_ELEMS,
+                    d_input, d_accept, d_start_vec,
+                    B, B_padded, L_val, d_results);
+            } else if (kernel_variant == 3) {
                 nfa_tc_binary_v3_kernel<<<n_blocks, BLOCK_SIZE, smem>>>(
                     d_T, d_T + N_ELEMS,
                     d_input, d_accept, d_start_vec,
@@ -923,12 +1264,16 @@ static void bench_throughput() {
     int lengths[]     = {128, 512, 2048};
     int n_batches = 5, n_lengths = 3;
 
-    for (int variant = 2; variant <= 4; variant++) {
-        const char *label = (variant <= 3) ? "TC" : "BitPar";
-        printf("\n=== NFA N=64 V%d (%s) Throughput Benchmark (binary) ===\n",
-               variant, label);
+    int variants[] = {2, 3, 35, 4};
+    int n_variants = 4;
+    for (int vi = 0; vi < n_variants; vi++) {
+        int variant = variants[vi];
+        const char *label = (variant == 4) ? "BitPar" : "TC";
+        const char *vlabel = (variant == 35) ? "3.5" : (variant == 2 ? "2" : (variant == 3 ? "3" : "4"));
+        printf("\n=== NFA N=64 V%s (%s) Throughput Benchmark (binary) ===\n",
+               vlabel, label);
         printf("  %8s  %6s  |  %8s  %8s  %8s\n", "B", "L", "Gc/s",
-               (variant <= 3) ? "TFLOPS" : "eq.TFLOP", "kern_ms");
+               (variant <= 35) ? "TFLOPS" : "eq.TFLOP", "kern_ms");
         printf("  %s\n", "---------------------------------------------------");
 
         for (int bi = 0; bi < n_batches; bi++) {
@@ -938,6 +1283,87 @@ static void bench_throughput() {
                 int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
 
                 nfa_tc_engine_init(trans, accept, start_vec, N, 2, B_padded, L_val);
+                g_nfa_engine.kernel_variant = variant;
+
+                srand(42);
+                size_t input_size = (size_t)L_val * B_padded;
+                std::vector<uint8_t> input(input_size, 2);
+                for (int b = 0; b < B; b++)
+                    for (int t = 0; t < L_val; t++)
+                        input[t * B_padded + b] = rand() % 2;
+
+                std::vector<int> results(B);
+
+                for (int w = 0; w < 3; w++)
+                    g_nfa_engine.dispatch(input.data(), B, L_val, B_padded,
+                                          results.data(), nullptr, nullptr);
+
+                int iters = 10;
+                float total_km = 0;
+                for (int it = 0; it < iters; it++) {
+                    float km;
+                    g_nfa_engine.dispatch(input.data(), B, L_val, B_padded,
+                                          results.data(), &km, nullptr);
+                    total_km += km;
+                }
+                float avg_km = total_km / iters;
+                double gchs = (double)B * L_val / (avg_km * 1e6);
+                double mma_per_pos = 32.0;
+                double flops_per_mma = 16.0 * 16.0 * 16.0 * 2.0;
+                double total_flops = (double)B_padded / TILE * mma_per_pos * flops_per_mma * L_val;
+                double tflops = total_flops / (avg_km * 1e9);
+
+                printf("  %8d  %6d  |  %8.1f  %8.1f  %8.3f\n",
+                       B, L_val, gchs, tflops, avg_km);
+
+                nfa_tc_engine_destroy();
+            }
+        }
+    }
+
+    // --- Probabilistic NFA: TC vs CUDA-core FP16 ---
+    // Random stochastic transition matrices (row sums ~1, all positive values)
+    float prob_trans[2 * N_ELEMS], prob_accept[N], prob_start[N];
+    memset(prob_accept, 0, sizeof(prob_accept));
+    memset(prob_start, 0, sizeof(prob_start));
+    prob_start[0] = 1.0f;
+    srand(77);
+    for (int s = 0; s < N; s++)
+        prob_accept[s] = (rand() % 4 == 0) ? 1.0f : 0.0f;
+
+    for (int c = 0; c < 2; c++) {
+        float *T = prob_trans + c * N_ELEMS;
+        for (int src = 0; src < N; src++) {
+            float row_sum = 0;
+            for (int dst = 0; dst < N; dst++) {
+                float v = (float)(rand() % 100 + 1);
+                T[dst * N + src] = v;
+                row_sum += v;
+            }
+            for (int dst = 0; dst < N; dst++)
+                T[dst * N + src] /= row_sum;
+        }
+    }
+
+    int prob_variants[] = {5, 6};
+    const char *prob_labels[] = {"TC", "CUDA"};
+    for (int vi = 0; vi < 2; vi++) {
+        int variant = prob_variants[vi];
+        printf("\n=== Probabilistic NFA N=64 V%d (%s) Throughput Benchmark ===\n",
+               variant, prob_labels[vi]);
+        printf("  %8s  %6s  |  %8s  %8s  %8s\n", "B", "L", "Gc/s", "TFLOPS", "kern_ms");
+        printf("  %s\n", "---------------------------------------------------");
+
+        int prob_batches[] = {4096, 16384, 65536, 262144};
+        int prob_lengths[] = {128, 512, 2048};
+
+        for (int bi = 0; bi < 4; bi++) {
+            for (int li = 0; li < 3; li++) {
+                int B = prob_batches[bi];
+                int L_val = prob_lengths[li];
+                int B_padded = ((B + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+
+                nfa_tc_engine_init(prob_trans, prob_accept, prob_start, N, 2, B_padded, L_val);
                 g_nfa_engine.kernel_variant = variant;
 
                 srand(42);
@@ -1032,6 +1458,42 @@ int main() {
         nfa_tc_engine_destroy();
     }
 
+    // V3 vs V3.5 cross-validation
+    {
+        printf("\n--- test_v3_v35_cross (4096 x 256, random NFA) ---\n");
+        float tr35[2 * N_ELEMS], ac35[N], sv35[N];
+        memset(tr35, 0, sizeof(tr35)); memset(ac35, 0, sizeof(ac35)); memset(sv35, 0, sizeof(sv35));
+        sv35[0] = 1.0f;
+        srand(55);
+        for (int s = 0; s < N; s++) if (rand() % 4 == 0) ac35[s] = 1.0f;
+        for (int c = 0; c < 2; c++) {
+            float *T = tr35 + c * N_ELEMS;
+            for (int src = 0; src < N; src++)
+                for (int ns = 0; ns < 1 + rand() % 3; ns++)
+                    T[(rand() % N) * N + src] = 1.0f;
+        }
+        int B35 = 4096, L35 = 256;
+        int B35_p = ((B35 + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+        srand(66);
+        size_t isz35 = (size_t)L35 * B35_p;
+        std::vector<uint8_t> inp35(isz35, 2);
+        for (int b = 0; b < B35; b++)
+            for (int t = 0; t < L35; t++)
+                inp35[t * B35_p + b] = rand() % 2;
+        std::vector<int> r3_35(B35), r35(B35);
+        nfa_tc_engine_init(tr35, ac35, sv35, N, 2, B35_p, L35);
+        g_nfa_engine.kernel_variant = 3;
+        g_nfa_engine.dispatch(inp35.data(), B35, L35, B35_p, r3_35.data(), nullptr, nullptr);
+        g_nfa_engine.kernel_variant = 35;
+        g_nfa_engine.dispatch(inp35.data(), B35, L35, B35_p, r35.data(), nullptr, nullptr);
+        int mm35 = 0;
+        for (int b = 0; b < B35; b++) if (r3_35[b] != r35[b]) mm35++;
+        char msg35[128];
+        snprintf(msg35, sizeof(msg35), "v3_v35_cross B=%d L=%d (%d mismatches)", B35, L35, mm35);
+        check(msg35, mm35 == 0);
+        nfa_tc_engine_destroy();
+    }
+
     // V3 vs V4 cross-validation
     {
         printf("\n--- test_v3_v4_cross (4096 x 256, random NFA) ---\n");
@@ -1103,6 +1565,49 @@ int main() {
             if (results[i] != (expected[i] ? 1 : 0)) v4_ok = 0;
         check("v4_basic (>=3 a's)", v4_ok == 1);
 
+        nfa_tc_engine_destroy();
+    }
+
+    // V5 (TC prob) vs V6 (CUDA prob) cross-validation with stochastic matrices
+    {
+        printf("\n--- test_v5_v6_cross (1024 x 64, stochastic matrices) ---\n");
+        float trP[2 * N_ELEMS], acP[N], svP[N];
+        memset(acP, 0, sizeof(acP)); memset(svP, 0, sizeof(svP));
+        svP[0] = 1.0f;
+        srand(88);
+        for (int s = 0; s < N; s++) acP[s] = (rand() % 4 == 0) ? 1.0f : 0.0f;
+        for (int c = 0; c < 2; c++) {
+            float *T = trP + c * N_ELEMS;
+            for (int src = 0; src < N; src++) {
+                float rsum = 0;
+                for (int dst = 0; dst < N; dst++) {
+                    float v = (float)(rand() % 100 + 1);
+                    T[dst * N + src] = v;
+                    rsum += v;
+                }
+                for (int dst = 0; dst < N; dst++)
+                    T[dst * N + src] /= rsum;
+            }
+        }
+        int BP = 1024, LP = 64;
+        int BP_p = ((BP + COLS_PER_BLOCK - 1) / COLS_PER_BLOCK) * COLS_PER_BLOCK;
+        srand(99);
+        size_t iszP = (size_t)LP * BP_p;
+        std::vector<uint8_t> inpP(iszP, 2);
+        for (int b = 0; b < BP; b++)
+            for (int t = 0; t < LP; t++)
+                inpP[t * BP_p + b] = rand() % 2;
+        std::vector<int> r5(BP), r6(BP);
+        nfa_tc_engine_init(trP, acP, svP, N, 2, BP_p, LP);
+        g_nfa_engine.kernel_variant = 5;
+        g_nfa_engine.dispatch(inpP.data(), BP, LP, BP_p, r5.data(), nullptr, nullptr);
+        g_nfa_engine.kernel_variant = 6;
+        g_nfa_engine.dispatch(inpP.data(), BP, LP, BP_p, r6.data(), nullptr, nullptr);
+        int mmP = 0;
+        for (int b = 0; b < BP; b++) if (r5[b] != r6[b]) mmP++;
+        char msgP[128];
+        snprintf(msgP, sizeof(msgP), "v5_v6_cross B=%d L=%d (%d mismatches)", BP, LP, mmP);
+        check(msgP, mmP == 0);
         nfa_tc_engine_destroy();
     }
 

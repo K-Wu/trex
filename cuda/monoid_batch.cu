@@ -38,6 +38,21 @@ constexpr int MP_BLOCK_SIZE = 256;
 } while(0)
 
 
+// ─── L2 Prefetch ─────────────────────────────────────────────────────────
+// H2D memcpy via DMA bypasses L2 cache. Without prefetch, the main kernel
+// hits cold L2 on every cache line. Reads one byte per 128-byte cache line.
+
+static __global__ void prefetch_l2(const uint8_t * __restrict__ data, int n_bytes,
+                                   int * __restrict__ dummy) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    int sum = 0;
+    for (int i = tid * 128; i < n_bytes; i += stride * 128)
+        sum += data[i];
+    if (tid == 0) *dummy = sum;
+}
+
+
 // ─── Batch Kernel ──────────────────────────────────────────────────────────
 
 __launch_bounds__(MB_BLOCK_SIZE, 16)
@@ -64,19 +79,19 @@ __global__ void monoid_batch_kernel(
         accept_sh[e] = d_accept[e];
     __syncthreads();
 
-    int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x;
-    if (sid >= B) return;
+    for (int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x; sid < B;
+         sid += gridDim.x * MB_BLOCK_SIZE) {
+        int start = offsets[sid];
+        int len   = offsets[sid + 1] - start;
+        uint8_t curr = identity;
 
-    int start = offsets[sid];
-    int len   = offsets[sid + 1] - start;
-    uint8_t curr = identity;
+        for (int t = 0; t < len; t++) {
+            uint8_t ch_idx = charmap_sh[raw_concat[start + t]];
+            curr = compose_sh[curr * sigma_ext + ch_idx];
+        }
 
-    for (int t = 0; t < len; t++) {
-        uint8_t ch_idx = charmap_sh[raw_concat[start + t]];
-        curr = compose_sh[curr * sigma_ext + ch_idx];
+        results[sid] = (int)accept_sh[curr];
     }
-
-    results[sid] = (int)accept_sh[curr];
 }
 
 
@@ -133,17 +148,17 @@ __global__ void monoid_batch_kernel_fused(
         accept_sh[e] = d_accept[e];
     __syncthreads();
 
-    int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x;
-    if (sid >= B) return;
+    for (int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x; sid < B;
+         sid += gridDim.x * MB_BLOCK_SIZE) {
+        int start = offsets[sid];
+        int len   = offsets[sid + 1] - start;
+        uint8_t curr = identity;
 
-    int start = offsets[sid];
-    int len   = offsets[sid + 1] - start;
-    uint8_t curr = identity;
+        for (int t = 0; t < len; t++)
+            curr = fused_sh[(int)curr * 256 + raw_concat[start + t]];
 
-    for (int t = 0; t < len; t++)
-        curr = fused_sh[(int)curr * 256 + raw_concat[start + t]];
-
-    results[sid] = (int)accept_sh[curr];
+        results[sid] = (int)accept_sh[curr];
+    }
 }
 
 
@@ -179,29 +194,29 @@ __global__ void monoid_batch_kernel_kgram(
         accept_sh[e] = d_accept[e];
     __syncthreads();
 
-    int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x;
-    if (sid >= B) return;
+    for (int sid = blockIdx.x * MB_BLOCK_SIZE + threadIdx.x; sid < B;
+         sid += gridDim.x * MB_BLOCK_SIZE) {
+        int start = offsets[sid];
+        int len   = offsets[sid + 1] - start;
+        const uint8_t *ptr = raw_concat + start;
+        uint8_t curr = identity;
 
-    int start = offsets[sid];
-    int len   = offsets[sid + 1] - start;
-    const uint8_t *ptr = raw_concat + start;
-    uint8_t curr = identity;
+        switch (kgram_k) {
+            case 8: kgram_compose_loop<8>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+            case 5: kgram_compose_loop<5>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+            case 4: kgram_compose_loop<4>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+            case 3: kgram_compose_loop<3>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+            case 2: kgram_compose_loop<2>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
+            default:
+                for (int t = 0; t < len; t++) {
+                    uint8_t ch = charmap_sh[ptr[t]];
+                    curr = compose_sh[(int)curr * sigma_ext + ch];
+                }
+                break;
+        }
 
-    switch (kgram_k) {
-        case 8: kgram_compose_loop<8>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
-        case 5: kgram_compose_loop<5>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
-        case 4: kgram_compose_loop<4>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
-        case 3: kgram_compose_loop<3>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
-        case 2: kgram_compose_loop<2>(ptr, len, charmap_sh, kgram_sh, compose_sh, sigma, sigma_ext, sigma_k, curr); break;
-        default:
-            for (int t = 0; t < len; t++) {
-                uint8_t ch = charmap_sh[ptr[t]];
-                curr = compose_sh[(int)curr * sigma_ext + ch];
-            }
-            break;
+        results[sid] = (int)accept_sh[curr];
     }
-
-    results[sid] = (int)accept_sh[curr];
 }
 
 
@@ -373,8 +388,11 @@ struct MonoidBatchEngine {
     uint8_t *d_raw_concat;
     int     *d_offsets;
     int     *d_results;
+    int     *d_dummy;
     int      max_total_chars;
     int      max_batch;
+    int      persistent_grid_tps;
+    int      n_sms;
 
     uint8_t *d_fused_compose;
     uint8_t *d_kgram_compose;
@@ -414,6 +432,7 @@ struct MonoidBatchEngine {
         CHECK_CUDA(cudaMalloc(&d_raw_concat,     max_chars));
         CHECK_CUDA(cudaMalloc(&d_offsets,        (max_b + 1) * sizeof(int)));
         CHECK_CUDA(cudaMalloc(&d_results,        max_b * sizeof(int)));
+        CHECK_CUDA(cudaMalloc(&d_dummy,          sizeof(int)));
 
         CHECK_CUDA(cudaMemcpy(d_char_compose,   char_compose,   M * sigma_ext,  cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_raw_char_map,   raw_char_map,   256,            cudaMemcpyHostToDevice));
@@ -424,6 +443,17 @@ struct MonoidBatchEngine {
         CHECK_CUDA(cudaEventCreate(&ev_stop));
         CHECK_CUDA(cudaEventCreate(&ev_kern_start));
         CHECK_CUDA(cudaEventCreate(&ev_kern_stop));
+
+        int device;
+        CHECK_CUDA(cudaGetDevice(&device));
+        cudaDeviceProp prop;
+        CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+        n_sms = prop.multiProcessorCount;
+        int smem_tps = M * sigma_ext + 256 + M;
+        int max_blocks_per_sm = 0;
+        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_sm, monoid_batch_kernel, MB_BLOCK_SIZE, smem_tps));
+        persistent_grid_tps = n_sms * max_blocks_per_sm;
     }
 
     void set_kgram_tables(const uint8_t *fused_compose,
@@ -456,6 +486,7 @@ struct MonoidBatchEngine {
         cudaFree(d_raw_concat);
         cudaFree(d_offsets);
         cudaFree(d_results);
+        cudaFree(d_dummy);
         if (d_fused_compose) cudaFree(d_fused_compose);
         if (d_kgram_compose) cudaFree(d_kgram_compose);
         cudaEventDestroy(ev_start);
@@ -474,6 +505,11 @@ struct MonoidBatchEngine {
 
         CHECK_CUDA(cudaMemcpy(d_raw_concat, h_raw_concat, total_chars, cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_offsets, h_offsets, (B + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+        // L2 prefetch: H2D DMA bypasses L2, warm it before kernel
+        int warm_grid = std::min((total_chars + 128 * 256 - 1) / (128 * 256), n_sms);
+        if (warm_grid > 0 && total_chars > 0)
+            prefetch_l2<<<warm_grid, 256>>>(d_raw_concat, total_chars, d_dummy);
 
         CHECK_CUDA(cudaEventRecord(ev_kern_start));
 
@@ -496,7 +532,8 @@ struct MonoidBatchEngine {
                 d_results
             );
         } else {
-            int grid = (B + MB_BLOCK_SIZE - 1) / MB_BLOCK_SIZE;
+            int needed = (B + MB_BLOCK_SIZE - 1) / MB_BLOCK_SIZE;
+            int grid = std::min(needed, persistent_grid_tps);
             int smem = M * sigma_ext + 256 + M;
             monoid_batch_kernel<<<grid, MB_BLOCK_SIZE, smem>>>(
                 d_raw_concat, d_offsets,
@@ -526,6 +563,10 @@ struct MonoidBatchEngine {
 
         CHECK_CUDA(cudaMemcpy(d_raw_concat, h_raw_concat, total_chars, cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_offsets, h_offsets, (B + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+        int warm_grid = std::min((total_chars + 128 * 256 - 1) / (128 * 256), n_sms);
+        if (warm_grid > 0 && total_chars > 0)
+            prefetch_l2<<<warm_grid, 256>>>(d_raw_concat, total_chars, d_dummy);
 
         int smem = M * sigma_ext + 256 + M * M + M + MP_BLOCK_SIZE;
 
